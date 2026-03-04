@@ -50,6 +50,11 @@ pub const TransactionResult = struct {
     compute_units: u64,
 };
 
+const BankError = error{
+    InvalidAddressLookup,
+    InvalidAddressLookupData,
+};
+
 pub const Bank = struct {
     allocator:         std.mem.Allocator,
     slot:              types.Slot,
@@ -282,8 +287,15 @@ pub const Bank = struct {
         };
         self.collected_fees += fee;
 
+        const runtime_account_keys = self.resolveAddressLookups(&tx.message) catch |e| {
+            return .{ .status = .err, .err = e, .fee = fee, .compute_units = 0 };
+        };
+        defer self.allocator.free(runtime_account_keys);
+        var runtime_message = tx.message;
+        runtime_message.account_keys = runtime_account_keys;
+
         // 4. Load accounts.
-        var la = runtime.loadAccounts(self.db, &tx.message, self.allocator) catch |e| {
+        var la = runtime.loadAccounts(self.db, &runtime_message, self.allocator) catch |e| {
             return .{ .status = .err, .err = e, .fee = fee, .compute_units = 0 };
         };
         defer la.deinit();
@@ -293,11 +305,11 @@ pub const Bank = struct {
             self.db,
             self.slot,
             self.epoch,
-            tx.message.recent_blockhash,
+            runtime_message.recent_blockhash,
             self.allocator,
             self.helper_features,
         );
-        const cu = runtime.executeTransaction(&ctx, &tx.message, &la) catch |e| {
+        const cu = runtime.executeTransaction(&ctx, &runtime_message, &la) catch |e| {
             // On runtime error, fee is still charged but changes are discarded.
             return .{ .status = .err, .err = e, .fee = fee, .compute_units = ctx.compute_used };
         };
@@ -307,7 +319,7 @@ pub const Bank = struct {
             return .{ .status = .err, .err = e, .fee = fee, .compute_units = cu };
         };
 
-        self.recordVoteCredits(tx);
+        self.recordVoteCredits(tx, &runtime_message);
         return .{ .status = .ok, .err = null, .fee = fee, .compute_units = cu };
     }
 
@@ -327,22 +339,23 @@ pub const Bank = struct {
         return false;
     }
 
-    fn recordVoteCredits(self: *Bank, tx: transaction.Transaction) void {
-        for (tx.message.instructions) |ix| {
-            if (@as(usize, ix.program_id_index) >= tx.message.account_keys.len) continue;
+    fn recordVoteCredits(self: *Bank, tx: transaction.Transaction, message: *const transaction.Message) void {
+        _ = tx;
+        for (message.instructions) |ix| {
+            if (@as(usize, ix.program_id_index) >= message.account_keys.len) continue;
             if (ix.data.len < 4) continue;
 
-            const program_id = tx.message.account_keys[ix.program_id_index];
+            const program_id = message.account_keys[ix.program_id_index];
             if (!std.mem.eql(u8, &program_id.bytes, &VOTE_PROGRAM_ID.bytes)) continue;
 
             const tag = std.mem.readInt(u32, ix.data[0..4], .little);
             if (tag != 1) continue;
-            if (ix.accounts.len == 0) continue;
+        if (ix.accounts.len == 0) continue;
 
             const vote_account_index = ix.accounts[0];
-            if (@as(usize, vote_account_index) >= tx.message.account_keys.len) continue;
+            if (@as(usize, vote_account_index) >= message.account_keys.len) continue;
 
-            const vote_account = tx.message.account_keys[@as(usize, vote_account_index)];
+            const vote_account = message.account_keys[@as(usize, vote_account_index)];
 
             // Only credit votes backed by active stake.
             if (!self.hasActiveStakeForVoteAccount(vote_account)) continue;
@@ -354,6 +367,43 @@ pub const Bank = struct {
                 result.value_ptr.* = 1;
             }
         }
+    }
+
+    fn resolveAddressLookups(self: *Bank, message: *const transaction.Message) ![]types.Pubkey {
+        var keys = std.ArrayListUnmanaged(types.Pubkey){};
+        try keys.ensureTotalCapacity(self.allocator, message.account_keys.len);
+        for (message.account_keys) |key| try keys.append(self.allocator, key);
+
+        if (!message.has_version_marker) return keys.toOwnedSlice(self.allocator);
+
+        for (message.address_table_lookups) |lookup| {
+            const table_account = self.db.get(lookup.account_key) orelse return BankError.InvalidAddressLookup;
+            defer if (comptime accounts_db.SEGMENT_STORE or accounts_db.PERSISTENT) {
+                self.allocator.free(table_account.data);
+            };
+            const table_data = table_account.data;
+            const addr_start = 56;
+
+            for (lookup.writable_indexes) |lookup_idx| {
+                const idx = @as(usize, lookup_idx);
+                const offset = addr_start + idx * 32;
+                if (offset + 32 > table_data.len) return BankError.InvalidAddressLookupData;
+                var key: types.Pubkey = undefined;
+                @memcpy(&key.bytes, table_data[offset .. offset + 32]);
+                try keys.append(self.allocator, key);
+            }
+
+            for (lookup.readonly_indexes) |lookup_idx| {
+                const idx = @as(usize, lookup_idx);
+                const offset = addr_start + idx * 32;
+                if (offset + 32 > table_data.len) return BankError.InvalidAddressLookupData;
+                var key: types.Pubkey = undefined;
+                @memcpy(&key.bytes, table_data[offset .. offset + 32]);
+                try keys.append(self.allocator, key);
+            }
+        }
+
+        return keys.toOwnedSlice(self.allocator);
     }
 
     fn settleEpochRewards(self: *Bank) !void {

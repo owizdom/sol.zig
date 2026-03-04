@@ -32,6 +32,7 @@ pub const Error = error{
     OutOfMemory,
     ComputeBudgetExceeded,
     ProgramFailed,
+    Overflow,
 };
 
 pub const ExecutionResult = struct {
@@ -877,7 +878,7 @@ fn resolveStackAddr(base: u64, off: i16, size: usize, alignment: usize, buffer_l
     const signed_base = @as(i64, @bitCast(base));
     const abs = @as(i128, signed_base) + @as(i128, off);
     if (abs < 0) return error.InvalidAddress;
-    if ((abs % @as(i128, @intCast(alignment))) != 0) return error.InvalidInstruction;
+    if ((@rem(abs, @as(i128, @intCast(alignment))) != 0)) return error.InvalidInstruction;
 
     const end = abs + @as(i128, @intCast(size));
     if (end > @as(i128, @intCast(buffer_len))) return error.InvalidAddress;
@@ -1460,7 +1461,11 @@ fn helperTransfer(ctx: *HelperContext) Error!u64 {
     if (src.lamports.* < amount) return error.InvalidInstruction;
 
     src.lamports.* -= amount;
-    dst.lamports.* +|= amount;
+    const add_result = @addWithOverflow(dst.lamports.*, amount);
+    const dst_after = add_result[0];
+    const overflow = add_result[1];
+    if (overflow != 0) return error.Overflow;
+    dst.lamports.* = dst_after;
     return 0;
 }
 

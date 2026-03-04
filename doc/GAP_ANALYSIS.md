@@ -22,7 +22,7 @@ Legend: [done] complete · [partial] partial · [missing] missing · [deferred] 
 | Stake split correctness | [done] | Full `StakeState` copied to destination (fixed from lamports-only bug) |
 | Stake account byte layout | [done] | 172 bytes (was 120, now checked via `core/invariants.zig`) |
 | Leader schedule (stake-weighted) | [done] | VRF seed, iterates active stake accounts from AccountsDB |
-| Versioned transactions (v0 + ALT) | [partial] | v0 prefix detected, ALT resolution placeholder |
+| Versioned transactions (v0 + ALT) | [done] | v0 prefix detected; `resolveAddressLookups()` expands ALT indexes before instruction dispatch |
 | Precompile programs (secp256k1, ed25519) | [missing] | Not implemented |
 | Address lookup table program | [missing] | ALT create/extend/deactivate/close not implemented |
 | Nonce accounts | [missing] | Durable nonces not implemented |
@@ -35,16 +35,19 @@ Legend: [done] complete · [partial] partial · [missing] missing · [deferred] 
 |------|--------|--------|
 | UDP gossip (push/pull) | [done] | Full CrdsValue push-pull cycle |
 | Gossip signature verification | [done] | Ed25519 verify on `signed_push` (kind=6); unsigned legacy fallback |
-| ContactInfo propagation | [done] | Peers discovered and stored in peer table |
+| ContactInfo propagation | [done] | Peers discovered and stored; public IP fetched from `api4.ipify.org` and broadcast via `setAdvertisedAddr()` |
 | TPU QUIC server | [done] | Accept QUIC streams, parse transactions |
 | Fair MEV ordering | [done] | Transactions sorted by `arrival_ns` before block packing |
 | Replay deduplication | [done] | `replay_window` HashMap(signature → timestamp), 30 s TTL |
 | TLS 1.3 handshake (pure Zig) | [done] | X25519 ECDH, HKDF-SHA256, ChaCha20-Poly1305; used in QUIC crypto frames |
-| QUIC packet number protection | [partial] | TLS traffic keys derived; AES-ECB header mask not applied (RFC 9001 §5.4) |
+| QUIC packet number protection | [done] | `applyHeaderProtection()` / `deriveQuicHpKey()` — AES-128-ECB mask per RFC 9001 §5.4 |
 | Shred propagation (Turbine) | [done] | Turbine tree built from stake-weighted peer set |
+| Turbine shred receiver (TVU) | [done] | `TurbineReceiver` bound on `gossip_port+1` (O_NONBLOCK); `turbineLoop` accumulates FecSets, counts `shreds_received`; TVU addr correctly advertised |
 | Shred Merkle proof validation | [partial] | Proof structure present; bit-for-bit Agave layout match not verified |
 | Gossip bit-for-bit mainnet compat | [partial] | Protocol is correct; bincode serialization may diverge on edge cases |
-| QUIC handshake interop (Agave peers) | [missing] | TLS wired internally but end-to-end Agave peering untested |
+| QUIC handshake interop (Agave peers) | [partial] | TLS wired via `onCryptoFrame`; devnet smoke confirms gossip peering; full QUIC stream interop pending firewall / shred replay |
+| Shred assembly + entry replay | [missing] | FEC reassembly done; bincode Entry parsing and bank replay deferred M7 |
+| Reed-Solomon FEC recovery | [missing] | Coding shreds stored but recovery not implemented; deferred M7 |
 
 ---
 
@@ -57,8 +60,12 @@ Legend: [done] complete · [partial] partial · [missing] missing · [deferred] 
 | Pure Zig segment store (WAL) | [done] | `storage/wal.zig` + `storage/segment.zig`; crash-safe via fsync |
 | Crash recovery via WAL replay | [done] | Index rebuilt deterministically from WAL records |
 | Segment compaction | [done] | `compact()` rewrites live entries, checkpoints WAL, deletes old segments |
-| Snapshot save/load | [done] | `snapshot/snapshot.zig` serializes accounts to disk |
+| Snapshot auto-save on shutdown | [done] | `Validator.saveSnapshot()` called from `deinit()`; writes SOLSNAP1 to `--snapshot-dir` |
+| Snapshot auto-load on restart | [done] | `maybeLoadSnapshot()` picks highest-slot file in dir; `bank.slot` restored; fixed zstd frame header bug (FHD 0x20→0xE0 with 8-byte FCS) |
+| Genesis snapshot on first boot | [done] | `bootstrapFromDevnet()` writes slot-0 snapshot if no prior snapshot exists |
+| WAL restart (bank.slot persistence) | [done] | Shutdown saves slot N → restart loads slot N → continues from N+1 |
 | Snapshot hash verification | [partial] | Hash computed but not cross-checked against gossip snapshot hash |
+| Devnet snapshot bootstrap (tar.bz2) | [missing] | Solana's snapshot format (bincode + RocksDB) is incompatible with SOLSNAP1; deferred M7 |
 | Incremental snapshots | [missing] | Full snapshot only; no delta snapshots |
 | AccountsDB parallelism | [missing] | Single mutex; no sharded locking |
 

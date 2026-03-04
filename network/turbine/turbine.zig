@@ -143,6 +143,10 @@ pub const TurbineReceiver = struct {
             std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
         const a = bind_addr.any;
         try std.posix.bind(sock, &a, bind_addr.getOsSockLen());
+        const flags = try std.posix.fcntl(sock, std.posix.F.GETFL, 0);
+        var o_flags: std.posix.O = @bitCast(@as(u32, @intCast(flags)));
+        o_flags.NONBLOCK = true;
+        _ = try std.posix.fcntl(sock, std.posix.F.SETFL, @as(usize, @intCast(@as(u32, @bitCast(o_flags)))));
         return .{ .sock = sock, .allocator = allocator };
     }
 
@@ -155,7 +159,7 @@ pub const TurbineReceiver = struct {
         var buf: [shred.SHRED_SIZE]u8 = undefined;
         var src: std.posix.sockaddr = undefined;
         var src_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-        const n = std.posix.recvfrom(self.sock, &buf, 0, &src, &src_len) catch return null;
+        const n = recvFromSocket(self.sock, &buf, 0, &src, &src_len) catch return null;
         if (n != shred.SHRED_SIZE) return null;
         return .{ .data = buf };
     }
@@ -172,6 +176,38 @@ pub const TurbineReceiver = struct {
         }
     }
 };
+
+fn recvFromSocket(
+    sock: std.posix.socket_t,
+    buf: []u8,
+    flags: u32,
+    src_addr: *std.posix.sockaddr,
+    src_len: *std.posix.socklen_t,
+) error{ WouldBlock, TimedOut, Interrupted, BadFileDescriptor }!usize {
+    const rc = std.c.recvfrom(
+        sock,
+        @ptrCast(buf.ptr),
+        buf.len,
+        flags,
+        src_addr,
+        src_len,
+    );
+    if (rc >= 0) return @intCast(rc);
+
+    const err = std.posix.errno(rc);
+    switch (err) {
+        .SUCCESS => unreachable,
+        .AGAIN => return error.WouldBlock,
+        .INTR => return error.Interrupted,
+        .TIMEDOUT => return error.TimedOut,
+        .BADF,
+        .CONNREFUSED,
+        .CONNRESET,
+        .CONNABORTED,
+        .NOTCONN => return error.BadFileDescriptor,
+        else => return error.BadFileDescriptor,
+    }
+}
 
 test "turbine layer calculation" {
     // Node 0: layer 0

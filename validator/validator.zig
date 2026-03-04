@@ -16,6 +16,9 @@ const metrics = @import("metrics");
 const tpu_quic = @import("net/tpu_quic");
 const tls_cert = @import("net/tls_cert");
 const snapshot_mod = @import("snapshot");
+const snapshot_bootstrap = @import("snapshot/bootstrap");
+const turbine_mod = @import("net/turbine");
+const shred_mod   = @import("net/shred");
 
 pub const Validator = struct {
     allocator: std.mem.Allocator,
@@ -41,6 +44,11 @@ pub const Validator = struct {
     tpu_server: ?tpu_quic.TpuQuicServer,
     tpu_cert_bundle: ?tls_cert.CertBundle,
     snapshot_dir: ?[]const u8,
+    turbine_receiver: ?turbine_mod.TurbineReceiver,
+    turbine_thread:   ?std.Thread,
+    tvu_running:      std.atomic.Value(bool),
+    shreds_received:  std.atomic.Value(u64),
+    tvu_port:         u16,
 
     pub fn init(allocator: std.mem.Allocator, identity: keypair.KeyPair) !*Validator {
         var self = try allocator.create(Validator);
@@ -66,6 +74,11 @@ pub const Validator = struct {
             .tpu_server = null,
             .tpu_cert_bundle = null,
             .snapshot_dir = null,
+            .turbine_receiver = null,
+            .turbine_thread   = null,
+            .tvu_running      = std.atomic.Value(bool).init(false),
+            .shreds_received  = std.atomic.Value(u64).init(0),
+            .tvu_port         = 0,
         };
 
         self.bank = try bank_mod.Bank.init(allocator, 0, &self.db, types.Hash.ZERO);
@@ -96,7 +109,17 @@ pub const Validator = struct {
         // Pre-seed an extra funded vote account for identity-based vote tests.
     }
 
+    pub fn saveSnapshot(self: *Validator) void {
+        const dir = self.snapshot_dir orelse return;
+        snapshot_mod.writeSnapshot(&self.db, self.bank.slot, dir, self.allocator) catch |err| {
+            std.debug.print("[warn] snapshot save slot {d}: {s}\n", .{ self.bank.slot, @errorName(err) });
+            return;
+        };
+        std.debug.print("snapshot saved: slot {d} → {s}/\n", .{ self.bank.slot, dir });
+    }
+
     pub fn deinit(self: *Validator) void {
+        self.saveSnapshot();
         self.stopServices();
 
         self.replay.deinit();
@@ -104,7 +127,7 @@ pub const Validator = struct {
         self.graph.deinit();
         self.blockstore.deinit();
         self.bank.deinit();
-        if (self.leader_snapshot) |snapshot| schedule.freeLeaderScheduleSnapshot(&snapshot, self.allocator);
+        if (self.leader_snapshot) |*snapshot| schedule.freeLeaderScheduleSnapshot(snapshot, self.allocator);
         if (self.leader_schedule) |schedule_data| self.allocator.free(schedule_data);
         self.db.deinit();
         if (self.snapshot_dir) |snapshot_dir| self.allocator.free(snapshot_dir);
@@ -136,13 +159,74 @@ pub const Validator = struct {
         self.refreshLeaderSchedule(self.bank.epoch) catch {};
     }
 
+    pub fn bootstrapFromDevnet(self: *Validator) void {
+        const genesis = snapshot_bootstrap.fetchGenesisHash(self.allocator) catch |err| {
+            std.debug.print("devnet bootstrap skipped (genesis): {}\n", .{err});
+            return;
+        };
+        defer self.allocator.free(genesis);
+
+        std.debug.print("devnet genesis hash: {s}\n", .{genesis});
+
+        _ = snapshot_bootstrap.fetchCurrentSlot(self.allocator) catch |err| {
+            std.debug.print("devnet bootstrap slot fetch skipped: {}\n", .{err});
+        };
+
+        self.maybeLoadSnapshot();
+
+        if (self.bank.slot == 0) {
+            if (self.snapshot_dir) |dir| {
+                snapshot_mod.writeSnapshot(&self.db, 0, dir, self.allocator) catch {};
+                std.debug.print("genesis snapshot written\n", .{});
+            }
+        }
+    }
+
+    pub fn seedGossipFromDevnet(self: *Validator) void {
+        // Discover public IP and advertise it so devnet validators can reach us back.
+        if (self.gossip_node) |*node| {
+            if (snapshot_bootstrap.fetchPublicIp(self.allocator)) |ip_str| {
+                defer self.allocator.free(ip_str);
+                const port = node.my_info.gossip.getPort();
+                if (snapshot_bootstrap.parseIpv4(ip_str, port)) |addr| {
+                    node.setAdvertisedAddr(addr);
+                    const ip4: [4]u8 = @bitCast(addr.in.sa.addr);
+                    std.debug.print("gossip advertising: {d}.{d}.{d}.{d}:{d}\n",
+                        .{ ip4[0], ip4[1], ip4[2], ip4[3], addr.getPort() });
+                    if (self.tvu_port != 0) {
+                        if (snapshot_bootstrap.parseIpv4(ip_str, self.tvu_port)) |tvu_addr| {
+                            node.my_info.tvu = tvu_addr;
+                        }
+                    }
+                } else {
+                    std.debug.print("could not parse public IP: {s}\n", .{ip_str});
+                }
+            } else |err| {
+                std.debug.print("public IP fetch failed ({s}), advertising bind addr\n", .{@errorName(err)});
+            }
+        }
+
+        const peers = snapshot_bootstrap.fetchGossipPeers(self.allocator, 64) catch |err| {
+            std.debug.print("devnet gossip bootstrap failed: {}\n", .{err});
+            return;
+        };
+        defer peers.deinit();
+
+        if (self.gossip_node) |*node| {
+            node.seedPeers(peers.items);
+            for (peers.items) |peer| {
+                node.sendPullRequest(peer) catch {};
+            }
+        }
+    }
+
     fn refreshLeaderSchedule(self: *Validator, epoch: types.Epoch) !void {
         const validators = [_]types.Pubkey{self.identity.publicKey()};
         const stakes = [_]types.Lamports{1_000_000_000};
 
-        if (self.leader_snapshot) |snapshot| {
+        if (self.leader_snapshot) |*snapshot| {
             if (snapshot.epoch == epoch) return;
-            schedule.freeLeaderScheduleSnapshot(&snapshot, self.allocator);
+            schedule.freeLeaderScheduleSnapshot(snapshot, self.allocator);
             self.leader_snapshot = null;
         }
 
@@ -162,40 +246,128 @@ pub const Validator = struct {
     }
 
     pub fn startServices(self: *Validator, gossip_port: ?u16, rpc_port: ?u16, metrics_port: ?u16) !void {
+        return self.startServicesInternal(gossip_port, rpc_port, metrics_port, false);
+    }
+
+    /// Strict mode is intended for real network runs (devnet/mainnet style participation).
+    /// It fails fast on bind failures instead of silently disabling services.
+    pub fn startServicesStrict(self: *Validator, gossip_port: ?u16, rpc_port: ?u16, metrics_port: ?u16) !void {
+        return self.startServicesInternal(gossip_port, rpc_port, metrics_port, true);
+    }
+
+    fn startServicesInternal(
+        self: *Validator,
+        gossip_port: ?u16,
+        rpc_port: ?u16,
+        metrics_port: ?u16,
+        strict: bool,
+    ) !void {
         self.maybeLoadSnapshot();
 
         if (gossip_port) |port| {
-            const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-            self.gossip_node = try gossip.GossipNode.init(self.allocator, self.identity, addr, 0);
-            self.gossip_thread = try self.gossip_node.?.start();
+            const any = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
+            const gossip_node = gossip.GossipNode.init(self.allocator, self.identity, any, 0) catch |err| blk: {
+                if (err == error.AccessDenied) {
+                    if (strict) return err;
+                    std.debug.print("[warn] gossip bind denied ({s}), disabled for this run\n", .{@errorName(err)});
+                    break :blk null;
+                }
+                return err;
+            };
+            if (gossip_node) |node| {
+                self.gossip_node = node;
+                self.gossip_thread = try self.gossip_node.?.start();
+            }
         }
 
+        if (gossip_port) |gport| {
+            const tvu_port: u16 = gport + 1;
+            self.tvu_port = tvu_port;
+            const tvu_addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, tvu_port);
+            if (turbine_mod.TurbineReceiver.init(self.allocator, tvu_addr)) |recv| {
+                self.turbine_receiver = recv;
+                if (self.gossip_node) |*node| node.my_info.tvu = tvu_addr;
+                self.tvu_running.store(true, .seq_cst);
+                self.turbine_thread = std.Thread.spawn(.{}, turbineLoop, .{self}) catch |err| blk: {
+                    std.debug.print("[warn] turbine thread: {s}\n", .{@errorName(err)});
+                    break :blk null;
+                };
+                std.debug.print("turbine recv bound on :{d}\n", .{tvu_port});
+            } else |err| {
+                std.debug.print("[warn] turbine bind :{d}: {s}\n", .{ tvu_port, @errorName(err) });
+            }
+        }
+
+        var rpc_started = false;
         if (rpc_port) |port| {
-            const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-            self.rpc_server = try rpc.RpcServer.init(self.allocator, addr, &self.bank, self.identity.publicKey());
-            self.rpc_thread = try self.rpc_server.?.start();
+            const any = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
+            const rpc_server = rpc.RpcServer.init(self.allocator, any, &self.bank, self.identity.publicKey()) catch |err| blk: {
+                if (err == error.AccessDenied) {
+                    if (strict) return err;
+                    std.debug.print("[warn] rpc bind denied ({s}), disabled for this run\n", .{@errorName(err)});
+                    break :blk null;
+                }
+                return err;
+            };
+            if (rpc_server) |server| {
+                self.rpc_server = server;
+                self.rpc_thread = try self.rpc_server.?.start();
+                rpc_started = true;
+            }
         }
 
         if (metrics_port) |port| {
-            const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-            self.metrics_server = try metrics_server.MetricsServer.init(addr, &metrics.GLOBAL);
-            self.metrics_thread = try self.metrics_server.?.start();
+            const any = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
+            const metrics_server_instance = metrics_server.MetricsServer.init(any, &metrics.GLOBAL) catch |err| blk: {
+                if (err == error.AccessDenied) {
+                    if (strict) return err;
+                    std.debug.print("[warn] metrics bind denied ({s}), disabled for this run\n", .{@errorName(err)});
+                    break :blk null;
+                }
+                return err;
+            };
+            if (metrics_server_instance) |instance| {
+                self.metrics_server = instance;
+                self.metrics_thread = try self.metrics_server.?.start();
+            }
         }
 
         if (rpc_port) |rpc_p| {
             if (rpc_p != std.math.maxInt(u16)) {
                 const tpu_port: u16 = @intCast(rpc_p + 1);
-                const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, tpu_port);
-        var cert = try tls_cert.generateSelfSigned(self.allocator, "/tmp/solana-in-zig-tpu");
-        errdefer cert.deinit();
-        self.tpu_cert_bundle = cert;
-                self.tpu_server = try tpu_quic.TpuQuicServer.init(self.allocator, addr, &self.bank, cert.cert_path, cert.key_path);
-                _ = try self.tpu_server.?.start();
+                const any = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, tpu_port);
+                if (!rpc_started and !strict) {
+                    std.debug.print("[warn] rpc not running, TPU startup disabled for this run\n", .{});
+                } else {
+                    const cert = try tls_cert.generateSelfSigned(self.allocator, "/tmp/solana-in-zig-tpu");
+                    const tpu_server = tpu_quic.TpuQuicServer.init(self.allocator, any, &self.bank, cert.cert_path, cert.key_path) catch |err| blk: {
+                        self.allocator.free(cert.cert_path);
+                        self.allocator.free(cert.key_path);
+                        if (err == error.AccessDenied) {
+                            if (strict) return err;
+                            std.debug.print("[warn] tpu bind denied ({s}), disabled for this run\n", .{@errorName(err)});
+                            break :blk null;
+                        }
+                        return err;
+                    };
+                    if (tpu_server) |server| {
+                        self.tpu_cert_bundle = cert;
+                        self.tpu_server = server;
+                        _ = try self.tpu_server.?.start();
+                    } else {
+                        self.allocator.free(cert.cert_path);
+                        self.allocator.free(cert.key_path);
+                    }
+                }
             }
         }
     }
 
     pub fn stopServices(self: *Validator) void {
+        self.tvu_running.store(false, .seq_cst);
+        if (self.turbine_thread) |t| { t.join(); self.turbine_thread = null; }
+        if (self.turbine_receiver) |*recv| { recv.deinit(); self.turbine_receiver = null; }
+
         if (self.rpc_server) |*server| {
             server.stop();
         }
@@ -275,6 +447,51 @@ pub const Validator = struct {
         return self.db.getLamports(pk);
     }
 };
+
+fn turbineLoop(self: *Validator) void {
+    const alloc = self.allocator;
+    var fec_sets = std.AutoHashMap(u64, shred_mod.FecSet).init(alloc);
+    defer {
+        var it = fec_sets.valueIterator();
+        while (it.next()) |fs| fs.deinit();
+        fec_sets.deinit();
+    }
+
+    while (self.tvu_running.load(.seq_cst)) {
+        const recv = if (self.turbine_receiver) |*r| r else break;
+        const sh = recv.recvShred() orelse {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+            continue;
+        };
+        _ = self.shreds_received.fetchAdd(1, .monotonic);
+
+        const slot    = sh.slot();
+        const fec_idx = sh.fecSetIndex();
+        const key     = (@as(u64, slot) << 16) | @as(u64, fec_idx);
+
+        const gop = fec_sets.getOrPut(key) catch continue;
+        if (!gop.found_existing)
+            gop.value_ptr.* = shred_mod.FecSet.init(alloc, slot, fec_idx);
+        gop.value_ptr.addShred(sh) catch continue;
+
+        if (gop.value_ptr.isComplete(1)) {
+            var out = std.array_list.Managed(u8).init(alloc);
+            if (gop.value_ptr.reassemble(&out)) |_| {
+                std.debug.print("[turbine] slot {d}: {d}B assembled ({d} shreds total)\n",
+                    .{ slot, out.items.len, self.shreds_received.load(.monotonic) });
+            } else |_| {}
+            out.deinit();
+            var fs = fec_sets.fetchRemove(key).?.value;
+            fs.deinit();
+        }
+
+        if (fec_sets.count() > 2000) {
+            var it2 = fec_sets.valueIterator();
+            while (it2.next()) |fs| fs.deinit();
+            fec_sets.clearAndFree();
+        }
+    }
+}
 
 test "validator initializes with genesis values" {
     const identity = keypair.KeyPair.generate();

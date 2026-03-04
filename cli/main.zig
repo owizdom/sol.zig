@@ -55,5 +55,4 @@ test {
     _ = @import("replay");
     _ = @import("rpc");
     _ = @import("validator");
-    _ = @import("../validation.zig");
 }

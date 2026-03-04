@@ -13,15 +13,15 @@ sol.zig implements the full validator lifecycle:
 
 - **Proof of History** — SHA256 tick chain
 - **Tower BFT** — vote lockout, root advancement, fork choice
-- **Gossip** — CRDS push/pull over UDP, Ed25519-signed CrdsValues
-- **Turbine** — stake-weighted shred broadcast tree
+- **Gossip** — CRDS push/pull over UDP, Ed25519-signed CrdsValues; public IP discovered and advertised; TVU addr correctly set in ContactInfo
+- **Turbine TVU** — live shred receiver on `gossip_port+1` (O_NONBLOCK UDP); FecSet accumulation; `shreds_received` atomic counter; stake-weighted broadcast tree for retransmit
 - **QUIC TPU** — transaction ingestion with fair MEV ordering (time-priority, not fee-priority)
 - **TLS 1.3** — pure Zig (X25519 + HKDF-SHA256 + ChaCha20-Poly1305), no OpenSSL
 - **Bank** — per-slot transaction processor: fees, rent, real inflation schedule, epoch rewards
 - **Runtime** — CPI dispatch, compute metering, BPF/SBF interpreter
 - **Programs** — System, Vote, Stake (with authority + lockup), SPL Token (19 instructions), Config, BPF Loader
 - **AccountsDB** — three backends: HashMap (default), RocksDB (optional), pure Zig WAL + segment store
-- **Persistence** — crash-safe write-ahead log + 64 MB flat segment files, zero C
+- **Persistence** — crash-safe WAL + 64 MB segment files; auto-save snapshot on shutdown; auto-load on restart (`--snapshot-dir`)
 - **JSON-RPC** — getBalance, sendTransaction, getSlot, getEpochInfo, getVoteAccounts, and more
 - **Observability** — Prometheus `/metrics` + OpenTelemetry OTLP HTTP export
 - **Library mode** — `libsol-gossip.a`, `libsol-bank.a`, `libsol-runtime.a`, `libsol-storage.a`
@@ -41,6 +41,8 @@ sol.zig implements the full validator lifecycle:
 | Comptime invariants | [done] | [missing] | [missing] |
 | OTLP telemetry | [done] | [missing] | [missing] |
 | Library artifacts | [done] (4 libs) | [missing] | [missing] |
+| Snapshot persistence | Auto save+restore | RocksDB | RocksDB |
+| Live shred receiver | [done] TVU O_NONBLOCK | Partial | Yes |
 | Mainnet compatible | Partial | Partial | Yes |
 
 ---
@@ -53,6 +55,16 @@ sol.zig implements the full validator lifecycle:
 zig build              # compile everything
 zig build run          # run the validator
 zig build bench        # TPS + PoH benchmark
+
+# Devnet smoke test — boots, joins gossip, receives shreds, advances slots
+zig build devnet-smoke
+mkdir -p /tmp/sol-snap
+./zig-out/bin/devnet-smoke --snapshot-dir /tmp/sol-snap
+# First run: writes genesis snapshot, binds TVU :8002, advances 100 slots, saves snapshot
+# Restart: loads snapshot (starts at slot 100+), no re-genesis
+./zig-out/bin/devnet-smoke --snapshot-dir /tmp/sol-snap --persist
+# Persist: keeps running, polls getClusterNodes every 30 s, prints shreds_recv counter
+# Requires UDP 8001 (gossip) + 8002 (TVU) open inbound for real shred reception
 
 # Standalone library targets (zero C, zero RocksDB)
 zig build lib-gossip   # → zig-out/lib/libsol-gossip.a
@@ -93,8 +105,8 @@ solana-In-Zig/
 │   ├── tpu_quic/          QUIC TPU server, time-priority MEV ordering
 │   ├── quic/              QUIC transport
 │   ├── tls/tls13.zig      Pure Zig TLS 1.3 (X25519 + ChaCha20-Poly1305 + HKDF)
-│   ├── shred/             Shred encode/decode/verify
-│   └── turbine/           Turbine broadcast tree
+│   ├── shred/             Shred encode/decode/verify + FecSet reassembly
+│   └── turbine/           Turbine broadcast tree + live TVU shred receiver (O_NONBLOCK)
 │
 ├── programs/
 │   ├── system/            Transfer, create, assign
@@ -118,7 +130,9 @@ solana-In-Zig/
 ├── transaction/           Parse, verify, serialize Solana transactions
 ├── rpc/                   JSON-RPC server
 ├── metrics/               Atomic counters + Prometheus + OTLP HTTP export
-├── snapshot/              Account snapshot save/load
+├── snapshot/
+│   ├── snapshot.zig       Account snapshot save/load (SOLSNAP1; auto-save on shutdown, auto-load on restart)
+│   └── bootstrap.zig      Pure Zig HTTP client: devnet RPC queries + public IP discovery
 ├── sync/
 │   ├── poh.zig            Proof-of-History SHA256 chain
 │   └── queue.zig          Lock-free MPSC queue
@@ -126,7 +140,8 @@ solana-In-Zig/
 ├── validator/             Top-level orchestrator + thread spawning
 ├── cli/main.zig           Entry point
 └── bin/
-    ├── bench.zig          TPS benchmark
+    ├── bench.zig              TPS benchmark
+    ├── devnet_smoke.zig       Devnet participation (--snapshot-dir, --persist, shreds_recv counter)
     └── replay_fixture_harness.zig
 ```
 
@@ -140,8 +155,13 @@ Every cryptographic primitive (`std.crypto`), every byte of disk I/O (`storage/`
 ### Fair MEV Ordering
 Transactions arriving at the TPU are stamped with `std.time.nanoTimestamp()` on receipt and sorted by arrival time before block packing. This eliminates the fee-auction MEV market that exists in all other validators. It is a hard protocol property, not a configuration option.
 
-### Crash-Safe Persistence
+### Crash-Safe Persistence + Snapshot Restart
 `storage/wal.zig` appends every account write as a CRC-verified record and calls `fsync` before returning. On restart, `storage/segment.zig` replays the WAL to reconstruct the full in-memory index. No account state is lost on process crash or power failure.
+
+On clean shutdown, `Validator.saveSnapshot()` writes the current AccountsDB + current slot to `{snapshot_dir}/snapshot-{slot}.bin.zst` (SOLSNAP1 format). On next start, `maybeLoadSnapshot()` picks the highest-slot file in the directory and resumes from that slot — so each restart picks up exactly where the previous run left off.
+
+### Live Turbine Shred Reception
+The validator binds a UDP socket on `gossip_port + 1` (default: 8002) as the TVU receive port and advertises it in the gossip ContactInfo. A dedicated `turbineLoop` thread pulls shreds with 1 ms poll, accumulates them into FecSets keyed by `(slot, fec_index)`, and assembles complete blocks when ready. The `shreds_received` atomic counter is visible in the `--persist` poll output (`shreds_recv=N`).
 
 ### Comptime Protocol Invariants
 `core/invariants.zig` asserts all protocol constants at compile time:
@@ -185,9 +205,13 @@ A background thread POSTs OTLP JSON to `http://localhost:4318/v1/metrics` every 
 | Comptime protocol invariants | [done] Full |
 | OTLP metrics export | [done] Full |
 | Library mode artifacts | [done] Full |
-| Versioned transactions (v0 + ALT) | [partial] Partial |
-| QUIC header protection (RFC 9001) | [partial] Partial |
-| Devnet boot (end-to-end) | [planned] Planned |
+| Versioned transactions (v0 + ALT) | [done] Full |
+| QUIC header protection (RFC 9001) | [done] Full |
+| Turbine shred receiver (TVU bind + FecSet) | [done] Full |
+| Snapshot auto-save/restore (SOLSNAP1) | [done] Full |
+| WAL restart (bank.slot persisted across restarts) | [done] Full |
+| TVU port advertisement + port diagnostics | [done] Full |
+| Devnet boot (end-to-end) | [in progress] Requires open inbound UDP 8001+8002 |
 | Mainnet wire compat | [planned] Planned |
 
 See [`doc/GAP_ANALYSIS.md`](doc/GAP_ANALYSIS.md) for the full status table.

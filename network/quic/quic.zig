@@ -1,4 +1,8 @@
 const std = @import("std");
+const tls13 = @import("net/tls13");
+
+const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+const Aes128 = std.crypto.core.aes.Aes128;
 
 const SERVICE_STREAM_ID: u64 = 0;
 const DEFAULT_STREAM_ID_STEP: u64 = 2;
@@ -14,20 +18,33 @@ const DEFAULT_INITIAL_CWND: usize = DEFAULT_SMTT * 2;
 const PTO_BASE_MS: i64 = 250;
 const PTO_MAX_BACKOFF: i64 = 4000;
 const ACK_COALESCE_WINDOW_MS: i64 = 10;
+const DEFAULT_AMPLIFICATION_FACTOR: usize = 3;
 const SUPPORTED_QUIC_VERSION: u32 = 1;
-const TLS_PLACEHOLDER_MAGIC_CLIENT: []const u8 = "ZIGTLS-CLIENT-HELLO";
-const TLS_PLACEHOLDER_MAGIC_SERVER: []const u8 = "ZIGTLS-SERVER-HELLO";
-const TLS_PLACEHOLDER_MAGIC_FINISH: []const u8 = "ZIGTLS-FINISHED";
+const MAX_RECV_PACKET_RANGE: usize = 64;
+const MAX_REPLAY_PACKET_GAP: u64 = 1 << 16;
 
 const FRAME_PADDING: u8 = 0x00;
 const FRAME_PING: u8 = 0x01;
 const FRAME_ACK: u8 = 0x02;
 const FRAME_ACK_ECN: u8 = 0x03;
+const FRAME_RESET_STREAM: u8 = 0x04;
+const FRAME_STOP_SENDING: u8 = 0x05;
 const FRAME_CRYPTO: u8 = 0x06;
+const FRAME_NEW_TOKEN: u8 = 0x07;
 const FRAME_STREAM_MASK: u8 = 0xF8;
 const FRAME_STREAM: u8 = 0x08;
 const FRAME_MAX_DATA: u8 = 0x10;
 const FRAME_MAX_STREAM_DATA: u8 = 0x11;
+const FRAME_MAX_STREAMS_BIDI: u8 = 0x12;
+const FRAME_MAX_STREAMS_UNI: u8 = 0x13;
+const FRAME_DATA_BLOCKED: u8 = 0x14;
+const FRAME_STREAM_DATA_BLOCKED: u8 = 0x15;
+const FRAME_STREAMS_BLOCKED_BIDI: u8 = 0x16;
+const FRAME_STREAMS_BLOCKED_UNI: u8 = 0x17;
+const FRAME_NEW_CONNECTION_ID: u8 = 0x18;
+const FRAME_RETIRE_CONNECTION_ID: u8 = 0x19;
+const FRAME_PATH_CHALLENGE: u8 = 0x1a;
+const FRAME_PATH_RESPONSE: u8 = 0x1b;
 const FRAME_CONNECTION_CLOSE: u8 = 0x1c;
 const FRAME_CONNECTION_CLOSE_APP: u8 = 0x1d;
 const FRAME_HANDSHAKE_DONE: u8 = 0x1e;
@@ -46,9 +63,22 @@ const FrameType = enum(u8) {
     ping = FRAME_PING,
     ack = FRAME_ACK,
     ack_ecn = FRAME_ACK_ECN,
+    reset_stream = FRAME_RESET_STREAM,
+    stop_sending = FRAME_STOP_SENDING,
     crypto = FRAME_CRYPTO,
+    new_token = FRAME_NEW_TOKEN,
     max_data = FRAME_MAX_DATA,
     max_stream_data = FRAME_MAX_STREAM_DATA,
+    max_streams_bidi = FRAME_MAX_STREAMS_BIDI,
+    max_streams_uni = FRAME_MAX_STREAMS_UNI,
+    data_blocked = FRAME_DATA_BLOCKED,
+    stream_data_blocked = FRAME_STREAM_DATA_BLOCKED,
+    streams_blocked_bidi = FRAME_STREAMS_BLOCKED_BIDI,
+    streams_blocked_uni = FRAME_STREAMS_BLOCKED_UNI,
+    new_connection_id = FRAME_NEW_CONNECTION_ID,
+    retire_connection_id = FRAME_RETIRE_CONNECTION_ID,
+    path_challenge = FRAME_PATH_CHALLENGE,
+    path_response = FRAME_PATH_RESPONSE,
     stream = FRAME_STREAM,
     connection_close = FRAME_CONNECTION_CLOSE,
     connection_close_app = FRAME_CONNECTION_CLOSE_APP,
@@ -76,6 +106,7 @@ pub const PacketHeader = struct {
     packet_number: u64,
     packet_number_len: u8,
     payload_offset: usize,
+    payload_length: usize,
 };
 
 const VarInt = struct {
@@ -106,7 +137,7 @@ const QuicConnState = enum(u8) {
 
 const QuicTlsMode = enum(u8) {
     disabled,
-    placeholder,
+    real,
 };
 
 const QuicTlsState = enum(u8) {
@@ -206,6 +237,9 @@ pub const QuicConn = struct {
     tls_mode: QuicTlsMode,
     tls_state: QuicTlsState,
     tls_compat: bool,
+    tls_hs_state: ?tls13.HandshakeState,
+    tls_ap_keys: ?tls13.TrafficKeys,
+    tls_hp_key: ?[16]u8,
     version: u32,
     crypto_recv_offset: u64,
     crypto_send_offset: u64,
@@ -241,6 +275,13 @@ pub const QuicConn = struct {
     received_ranges: std.ArrayListUnmanaged(PacketRange),
     peer_ack_pending: bool,
     peer_ack_first_send_ms: i64,
+    peer_addr_validated: bool,
+    allow_zero_rtt: bool,
+    bytes_received_from_peer: usize,
+    bytes_sent_to_peer: usize,
+    peer_ecn_ect0: u64,
+    peer_ecn_ect1: u64,
+    peer_ecn_ce: u64,
 
     closed: bool,
 
@@ -276,6 +317,9 @@ pub const QuicConn = struct {
             .tls_mode = tls_mode,
             .tls_state = .waiting_for_client_hello,
             .tls_compat = true,
+            .tls_hs_state = null,
+            .tls_ap_keys = null,
+            .tls_hp_key = null,
             .crypto_recv_offset = 0,
             .crypto_send_offset = 0,
             .crypto_rx = .{},
@@ -306,6 +350,13 @@ pub const QuicConn = struct {
             .received_ranges = .{},
             .peer_ack_pending = false,
             .peer_ack_first_send_ms = 0,
+            .peer_addr_validated = false,
+            .allow_zero_rtt = false,
+            .bytes_received_from_peer = 0,
+            .bytes_sent_to_peer = 0,
+            .peer_ecn_ect0 = 0,
+            .peer_ecn_ect1 = 0,
+            .peer_ecn_ce = 0,
             .closed = false,
         };
 
@@ -419,7 +470,8 @@ pub const QuicConn = struct {
     }
 
     fn ptoDelayMs(self: *const QuicConn) i64 {
-        const backoff = @as(i64, @intCast(1 << @as(u6, self.pto_count)));
+        const backoff_shift: u6 = if (self.pto_count > 62) 62 else @intCast(self.pto_count);
+        const backoff = @as(i64, 1) << backoff_shift;
         const delay = self.rttEstimateMs() * backoff;
         return @min(delay, PTO_MAX_BACKOFF);
     }
@@ -428,6 +480,37 @@ pub const QuicConn = struct {
         const estimated_overhead = 1 + 8 + 4 + 1 + 10 + 10 + 10;
         if (self.path_mtu <= estimated_overhead) return 1;
         return self.path_mtu - estimated_overhead;
+    }
+
+    fn decodePacketNumber(self: *const QuicConn, packet_number: u64, packet_number_len: u8) u64 {
+        const packet_number_width: u64 = switch (packet_number_len) {
+            1 => @as(u64, 1) << 8,
+            2 => @as(u64, 1) << 16,
+            4 => @as(u64, 1) << 32,
+            8 => return packet_number,
+            else => return packet_number,
+        };
+        const half_window = packet_number_width >> 1;
+        const mask = packet_number_width - 1;
+
+        const largest = if (self.received_ranges.items.len > 0)
+            self.received_ranges.items[self.received_ranges.items.len - 1].end
+        else
+            0;
+
+        var candidate = (largest & ~mask) | packet_number;
+
+        if (candidate > largest) {
+            if (candidate - largest > half_window) {
+                candidate -%= packet_number_width;
+            }
+        } else {
+            if (largest - candidate > half_window) {
+                candidate +%= packet_number_width;
+            }
+        }
+
+        return candidate;
     }
 
     fn varIntLen(v: u64) usize {
@@ -447,7 +530,23 @@ pub const QuicConn = struct {
         return self.received_ranges.items.len;
     }
 
+    fn isStalePacketNumber(self: *const QuicConn, packet_number: u64) bool {
+        if (self.received_ranges.items.len == 0) return false;
+        const latest = self.received_ranges.items[self.received_ranges.items.len - 1].end;
+        if (latest <= MAX_REPLAY_PACKET_GAP) return false;
+        const stale_floor = latest - MAX_REPLAY_PACKET_GAP;
+        return packet_number < stale_floor;
+    }
+
+    fn trimReceivedRanges(self: *QuicConn) void {
+        if (self.received_ranges.items.len <= MAX_RECV_PACKET_RANGE) return;
+        while (self.received_ranges.items.len > MAX_RECV_PACKET_RANGE) {
+            _ = self.received_ranges.orderedRemove(0);
+        }
+    }
+
     fn registerReceivedPacket(self: *QuicConn, packet_number: u64) void {
+        if (self.isStalePacketNumber(packet_number)) return;
         const insert_idx = self.receivedPacketRangeIndex(packet_number) orelse {
             self.peer_ack_pending = true;
             return;
@@ -478,18 +577,11 @@ pub const QuicConn = struct {
             self.received_ranges.insert(self.allocator, insert_idx, .{
                 .start = packet_number,
                 .end = packet_number,
-            }) catch |err| {
-                _ = err;
-                return;
-            };
+            }) catch return;
         }
+        self.trimReceivedRanges();
         self.peer_ack_pending = true;
         if (self.peer_ack_first_send_ms == 0) self.peer_ack_first_send_ms = std.time.milliTimestamp();
-    }
-
-    fn startsWith(haystack: []const u8, needle: []const u8) bool {
-        if (haystack.len < needle.len) return false;
-        return std.mem.eql(u8, haystack[0..needle.len], needle);
     }
 
     fn dropPrefix(list: *std.ArrayListUnmanaged(u8), len: usize) void {
@@ -504,13 +596,37 @@ pub const QuicConn = struct {
     }
 
     fn isHandshakeActive(self: *const QuicConn) bool {
-        return self.tls_mode == .placeholder and self.tls_state != .established;
+        return self.tls_mode == .real and self.tls_state != .established;
+    }
+
+    fn addBytesSaturating(_: *QuicConn, counter: *usize, delta: usize) void {
+        const remaining = std.math.maxInt(usize) -% counter.*;
+        if (remaining >= delta) {
+            counter.* += delta;
+        } else {
+            counter.* = std.math.maxInt(usize);
+        }
+    }
+
+    fn amplificationLimit(self: *const QuicConn) usize {
+        if (self.bytes_received_from_peer == 0) return 0;
+        if (self.bytes_received_from_peer > std.math.maxInt(usize) / DEFAULT_AMPLIFICATION_FACTOR) {
+            return std.math.maxInt(usize);
+        }
+        return self.bytes_received_from_peer * DEFAULT_AMPLIFICATION_FACTOR;
+    }
+
+    fn canSendWithinAmplification(self: *const QuicConn, bytes: usize) bool {
+        if (self.tls_mode == .disabled or self.peer_addr_validated) return true;
+        const limit = self.amplificationLimit();
+        return limit == std.math.maxInt(usize) or self.bytes_sent_to_peer + bytes <= limit;
     }
 
     fn markTlsEstablished(self: *QuicConn) void {
         if (self.tls_mode == .disabled or self.tls_state == .established) return;
         self.tls_state = .established;
         self.state = .connected;
+        self.peer_addr_validated = true;
         self.tls_compat = true;
         self.recv_cond.signal();
     }
@@ -550,24 +666,68 @@ pub const QuicConn = struct {
 
     fn onCryptoFrame(self: *QuicConn, frame_offset: u64, payload: []const u8) !void {
         if (self.tls_mode == .disabled) return;
-        if (frame_offset != self.crypto_recv_offset) return;
-        try self.crypto_rx.appendSlice(self.allocator, payload);
-        self.crypto_recv_offset += @as(u64, payload.len);
 
-        if (self.tls_state == .waiting_for_client_hello) {
-            if (startsWith(self.crypto_rx.items, TLS_PLACEHOLDER_MAGIC_CLIENT)) {
-                dropPrefix(&self.crypto_rx, TLS_PLACEHOLDER_MAGIC_CLIENT.len);
-                self.tls_state = .sent_server_hello;
-                self.tls_compat = false;
-                try self.crypto_tx.appendSlice(self.allocator, TLS_PLACEHOLDER_MAGIC_SERVER);
-                try self.queueCryptoFrame(TLS_PLACEHOLDER_MAGIC_SERVER);
+        if (self.tls_mode == .real) {
+            if (frame_offset != self.crypto_recv_offset) return;
+            try self.crypto_rx.appendSlice(self.allocator, payload);
+            self.crypto_recv_offset += @as(u64, payload.len);
+
+            if (self.tls_state == .waiting_for_client_hello) {
+                if (tlsRxHasFullFrame(self)) {
+                    var hs: tls13.HandshakeState = undefined;
+                    var random: [32]u8 = undefined;
+                    std.crypto.random.bytes(&random);
+                    const response = tls13.TLS13.serverHello(
+                        self.allocator,
+                        self.crypto_rx.items,
+                        random,
+                        &hs,
+                    ) catch {
+                        self.tls_state = .failed;
+                        return;
+                    };
+                    defer self.allocator.free(response);
+
+                    self.tls_hs_state = hs;
+                    self.tls_state = .sent_server_hello;
+                    if (hs.hs_keys) |keys| {
+                        self.tls_ap_keys = keys;
+                        self.tls_hp_key = deriveQuicHpKey(keys.server_key);
+                    }
+                    dropPrefix(&self.crypto_rx, self.crypto_rx.items.len);
+                    try self.queueCryptoFrame(response);
+                    return;
+                }
+                return;
             }
+
+            if (self.tls_state == .sent_server_hello and self.tls_hs_state != null) {
+                if (self.tls_hs_state) |*hs| {
+                    if (hs.hs_keys) |*keys| {
+                        var plain: [256]u8 = undefined;
+                        const plain_len = tls13.TLS13.decryptClient(keys, self.crypto_rx.items, &plain) catch {
+                            return;
+                        };
+                        if (plain_len > 0 and plain[0] == 0x14) {
+                            if (hs.ap_keys) |ap_keys| {
+                                self.tls_ap_keys = ap_keys;
+                                if (self.tls_hp_key == null) self.tls_hp_key = deriveQuicHpKey(ap_keys.client_key);
+                            }
+                            if (self.tls_ap_keys) |ap_keys| {
+                                if (self.tls_hp_key == null) self.tls_hp_key = deriveQuicHpKey(ap_keys.client_key);
+                            }
+                            dropPrefix(&self.crypto_rx, self.crypto_rx.items.len);
+                            self.markTlsEstablished();
+                        }
+                    }
+                }
+                return;
+            }
+
+            return;
         }
 
-        if (self.tls_state == .sent_server_hello and startsWith(self.crypto_rx.items, TLS_PLACEHOLDER_MAGIC_FINISH)) {
-            dropPrefix(&self.crypto_rx, TLS_PLACEHOLDER_MAGIC_FINISH.len);
-            self.markTlsEstablished();
-        }
+        return;
     }
 
     fn buildAckFrame(self: *QuicConn, out: []u8) !usize {
@@ -683,9 +843,9 @@ pub const QuicConn = struct {
         rec.deinit(self.allocator);
         self.allocator.destroy(rec);
         _ = self.sent_packets.remove(packet_number);
-        if (self.sent_order.len > 0) {
+        if (self.sent_order.items.len > 0) {
             var remove_i: usize = 0;
-            while (remove_i < self.sent_order.len) : (remove_i += 1) {
+            while (remove_i < self.sent_order.items.len) : (remove_i += 1) {
                 if (self.sent_order.items[remove_i] == packet_number) {
                     _ = self.sent_order.swapRemove(remove_i);
                     break;
@@ -700,7 +860,7 @@ pub const QuicConn = struct {
         if (!self.has_rtt_sample) {
             self.has_rtt_sample = true;
             self.smoothed_rtt_ms = sample;
-            self.rtt_var_ms = @max(sample / 2, 1);
+            self.rtt_var_ms = @max(@divTrunc(sample, 2), 1);
             self.min_rtt_ms = sample;
             return;
         }
@@ -710,8 +870,8 @@ pub const QuicConn = struct {
             sample - self.smoothed_rtt_ms
         else
             self.smoothed_rtt_ms - sample;
-        self.rtt_var_ms = (3 * self.rtt_var_ms + err) / 4;
-        self.smoothed_rtt_ms = (7 * self.smoothed_rtt_ms + sample) / 8;
+        self.rtt_var_ms = @divTrunc(3 * self.rtt_var_ms + err, 4);
+        self.smoothed_rtt_ms = @divTrunc(7 * self.smoothed_rtt_ms + sample, 8);
     }
 
     fn congestionLossAdjustment(self: *QuicConn) void {
@@ -843,7 +1003,7 @@ pub const QuicConn = struct {
     fn canAcceptPeerAddr(self: *QuicConn, peer_addr: std.posix.sockaddr, peer_len: std.posix.socklen_t) bool {
         self.state_mu.lock();
         defer self.state_mu.unlock();
-        if (self.state == .connected) return self.peerAddrMatches(peer_addr, peer_len);
+        if (self.state == .connected) return self.peer_addr_validated and self.peerAddrMatches(peer_addr, peer_len);
         return true;
     }
 
@@ -853,12 +1013,14 @@ pub const QuicConn = struct {
         retransmit_payload: usize,
     ) !usize {
         if (frame_payload.len == 0) return 0;
+        if (!self.canSendWithinAmplification(frame_payload.len)) return error.AmplificationLimitExceeded;
         const use_long_header = self.state != .connected;
         const packet_type = if (self.state == .pre_init or self.state == .handshake)
             PacketType.handshake
         else
             PacketType.one_rtt;
         const packet_number = self.send_packet_number;
+        const packet_number_len: u8 = packetNumberLen(packet_number);
         const now_ms = std.time.milliTimestamp();
         if (now_ms < 0) return 0;
 
@@ -873,12 +1035,33 @@ pub const QuicConn = struct {
             self.local_cid[0..@as(usize, self.local_cid_len)],
             packet_number,
             packet_type,
+            frame_payload.len,
         ) catch return error.FrameTooLarge;
         self.send_packet_number +%= 1;
 
         if (off + frame_payload.len > packet.len) return error.FrameTooLarge;
         @memcpy(packet[off .. off + frame_payload.len], frame_payload);
         const sent_len = off + frame_payload.len;
+
+        if (self.tls_ap_keys != null and self.tls_hp_key != null) {
+            const token_len_for_hp: usize = if (packet_type == .initial or packet_type == .retry) 1 else 0;
+            const pn_offset = if (self.state == .connected)
+                1 + @as(usize, self.dcid_len)
+            else
+                (1 +
+                    4 + // version
+                    1 + @as(usize, self.dcid_len) + // dcid len + dcid
+                    1 + @as(usize, self.local_cid_len) + // scid len + scid
+                    token_len_for_hp // token-length byte for Initial/Retry packets (token is encoded as zero here)
+                );
+            applyHeaderProtection(
+                self.tls_hp_key.?,
+                packet[0..sent_len],
+                pn_offset,
+                packet_number_len,
+                self.state != .connected,
+            );
+        }
 
         const sent = try std.posix.sendto(
             self.socket,
@@ -887,9 +1070,10 @@ pub const QuicConn = struct {
             &self.peer_addr,
             self.peer_addr_len,
         );
+        self.addBytesSaturating(&self.bytes_sent_to_peer, sent);
 
         if (retransmit_payload > 0) {
-            var raw = try self.allocator.alloc(u8, sent_len);
+            const raw = try self.allocator.alloc(u8, sent_len);
             @memcpy(raw, packet[0..sent_len]);
             const rec = try self.allocator.create(SentPacket);
             rec.* = SentPacket.init(packet_number, raw, now_ms, retransmit_payload);
@@ -915,7 +1099,7 @@ pub const QuicConn = struct {
     }
 
     fn makeStreamFrame(
-        self: *QuicConn,
+        _: *QuicConn,
         out: []u8,
         stream_id: u64,
         stream_offset: u64,
@@ -939,12 +1123,11 @@ pub const QuicConn = struct {
     }
 
     fn makeCryptoFrame(
-        self: *QuicConn,
+        _: *QuicConn,
         out: []u8,
         crypto_offset: u64,
         payload: []const u8,
     ) !usize {
-        _ = self;
         var off: usize = 0;
         if (off >= out.len) return error.FrameTooLarge;
         out[off] = FRAME_CRYPTO;
@@ -965,7 +1148,7 @@ pub const QuicConn = struct {
 
         try self.maybeRetransmit();
         if (self.state == .closed or self.state == .draining) return error.ConnectionClosed;
-        if (self.tls_mode == .placeholder and self.tls_state != .established and stream_id == SERVICE_STREAM_ID) {
+        if (self.tls_mode == .real and self.tls_state != .established and stream_id == SERVICE_STREAM_ID) {
             return error.HandshakeInProgress;
         }
         const stream = if (stream_id == SERVICE_STREAM_ID)
@@ -981,7 +1164,7 @@ pub const QuicConn = struct {
         var offset: usize = 0;
         var sent_total: usize = 0;
         const max_payload = self.maxSendPayload();
-        const ack_headroom = if (self.peer_ack_pending) 64 else 0;
+        const ack_headroom: usize = if (self.peer_ack_pending) @as(usize, 64) else 0;
         const chunk_budget = if (max_payload > ack_headroom) max_payload - ack_headroom else max_payload;
 
         while (offset < data.len) {
@@ -1078,6 +1261,8 @@ pub const QuicConn = struct {
         if (self.state == .closed or self.state == .draining) return;
 
         const stream = try self.ensureRemoteStreamState(stream_id);
+        if (stream.state == .closed) return error.StreamClosed;
+        if (stream.fin_recv and payload.len > 0) return error.StreamClosed;
 
         const offset = if (has_offset) frame_offset else stream.recv_offset;
         if (payload.len > 0) {
@@ -1134,9 +1319,7 @@ pub const QuicConn = struct {
     fn parseAckFrame(self: *QuicConn, payload: []const u8, off: *usize, with_ecn: bool) !void {
         const largest = try decodeVarInt(payload[off.*..]);
         off.* += largest.bytes;
-        const ack_delay = try decodeVarInt(payload[off.*..]);
-        off.* += ack_delay.bytes;
-        _ = ack_delay;
+        off.* += (try decodeVarInt(payload[off.*..])).bytes;
         const range_count = try decodeVarInt(payload[off.*..]);
         off.* += range_count.bytes;
 
@@ -1167,15 +1350,15 @@ pub const QuicConn = struct {
         }
 
         if (!with_ecn) return;
+        const ecn_ect0 = try decodeVarInt(payload[off.*..]);
+        off.* += ecn_ect0.bytes;
+        const ecn_ect1 = try decodeVarInt(payload[off.*..]);
+        off.* += ecn_ect1.bytes;
         const ecn_ce = try decodeVarInt(payload[off.*..]);
         off.* += ecn_ce.bytes;
-        const ecn_nce = try decodeVarInt(payload[off.*..]);
-        off.* += ecn_nce.bytes;
-        const ecn_m = try decodeVarInt(payload[off.*..]);
-        off.* += ecn_m.bytes;
-        _ = ecn_ce;
-        _ = ecn_nce;
-        _ = ecn_m;
+        self.peer_ecn_ect0 = ecn_ect0.value;
+        self.peer_ecn_ect1 = ecn_ect1.value;
+        self.peer_ecn_ce = ecn_ce.value;
     }
 
     fn parseAndApplyFrames(self: *QuicConn, payload: []const u8) !void {
@@ -1191,7 +1374,7 @@ pub const QuicConn = struct {
                 const has_len = (frame_type & 0x02) != 0;
                 const is_fin = (frame_type & 0x01) != 0;
 
-                if (self.tls_mode == .placeholder and self.tls_state != .established) {
+                if (self.tls_mode == .real and self.tls_state != .established) {
                     return error.HandshakeInProgress;
                 }
 
@@ -1228,13 +1411,31 @@ pub const QuicConn = struct {
                 @intFromEnum(FrameType.ack_ecn) => {
                     try self.parseAckFrame(payload, &off, true);
                 },
+                @intFromEnum(FrameType.reset_stream) => {
+                    const stream_id = try decodeVarInt(payload[off..]);
+                    off += stream_id.bytes;
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                    const final_size = try decodeVarInt(payload[off..]);
+                    off += final_size.bytes;
+                    if (final_size.value > std.math.maxInt(usize)) return error.InvalidFrame;
+                    const final_size_usize: usize = @intCast(final_size.value);
+                    if (off + final_size_usize > payload.len) return error.InvalidFrame;
+                    if (self.streams.get(stream_id.value)) |stream| stream.state = .closed;
+                    off += final_size_usize;
+                },
+                @intFromEnum(FrameType.stop_sending) => {
+                    const stream_id = try decodeVarInt(payload[off..]);
+                    off += stream_id.bytes;
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                    if (self.streams.get(stream_id.value)) |stream| stream.state = .half_closed_local;
+                },
                 @intFromEnum(FrameType.crypto) => {
                     const stream_offset = try decodeVarInt(payload[off..]);
                     off += stream_offset.bytes;
                     const data_len = try decodeVarInt(payload[off..]);
                     off += data_len.bytes;
                     if (data_len.value > std.math.maxInt(usize)) return error.InvalidFrame;
-                    const data_len_usize = @intCast(data_len.value);
+                    const data_len_usize: usize = @intCast(data_len.value);
                     if (off + data_len_usize > payload.len) return error.InvalidFrame;
                     const data = payload[off .. off + data_len_usize];
                     off += data_len_usize;
@@ -1255,6 +1456,54 @@ pub const QuicConn = struct {
                     off += max_data.bytes;
                     try self.applyFrameMaxStreamData(stream_vi.value, max_data.value);
                 },
+                @intFromEnum(FrameType.max_streams_bidi) => {
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                },
+                @intFromEnum(FrameType.max_streams_uni) => {
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                },
+                @intFromEnum(FrameType.data_blocked) => {
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                },
+                @intFromEnum(FrameType.stream_data_blocked) => {
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                },
+                @intFromEnum(FrameType.streams_blocked_bidi) => {
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                },
+                @intFromEnum(FrameType.streams_blocked_uni) => {
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                },
+                @intFromEnum(FrameType.new_token) => {
+                    const token_len = try decodeVarInt(payload[off..]);
+                    off += token_len.bytes;
+                    if (token_len.value > std.math.maxInt(usize)) return error.InvalidFrame;
+                    const token_len_usize: usize = @intCast(token_len.value);
+                    if (off + token_len_usize > payload.len) return error.InvalidFrame;
+                    off += token_len_usize;
+                },
+                @intFromEnum(FrameType.new_connection_id) => {
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                    if (off >= payload.len) return error.InvalidFrame;
+                    const cid_len = payload[off];
+                    off += 1;
+                    if (cid_len > 20) return error.InvalidFrame;
+                    if (off + cid_len + 16 > payload.len) return error.InvalidFrame;
+                    off += cid_len + 16;
+                },
+                @intFromEnum(FrameType.retire_connection_id) => {
+                    off += (try decodeVarInt(payload[off..])).bytes;
+                },
+                @intFromEnum(FrameType.path_challenge) => {
+                    if (off + 8 > payload.len) return error.InvalidFrame;
+                    off += 8;
+                },
+                @intFromEnum(FrameType.path_response) => {
+                    if (off + 8 > payload.len) return error.InvalidFrame;
+                    off += 8;
+                },
                 @intFromEnum(FrameType.connection_close) => {
                     const frame_err = try decodeVarInt(payload[off..]);
                     off += frame_err.bytes;
@@ -1263,9 +1512,7 @@ pub const QuicConn = struct {
                     const reason_len = try decodeVarInt(payload[off..]);
                     off += reason_len.bytes;
                     if (reason_len.value > std.math.maxInt(usize)) return error.InvalidFrame;
-                    const reason_len_usize = @intCast(reason_len.value);
-                    _ = frame_err;
-                    _ = frame_ty;
+                    const reason_len_usize: usize = @as(usize, @intCast(reason_len.value));
                     if (off + reason_len_usize > payload.len) return error.InvalidFrame;
                     off += reason_len_usize;
                     self.applyConnectionClose();
@@ -1277,8 +1524,7 @@ pub const QuicConn = struct {
                     const reason_len = try decodeVarInt(payload[off..]);
                     off += reason_len.bytes;
                     if (reason_len.value > std.math.maxInt(usize)) return error.InvalidFrame;
-                    const reason_len_usize = @intCast(reason_len.value);
-                    _ = frame_err;
+                    const reason_len_usize: usize = @as(usize, @intCast(reason_len.value));
                     if (off + reason_len_usize > payload.len) return error.InvalidFrame;
                     off += reason_len_usize;
                     self.applyConnectionClose();
@@ -1293,18 +1539,44 @@ pub const QuicConn = struct {
     fn applyPacket(self: *QuicConn, header: PacketHeader) void {
         switch (header.packet_type) {
             .initial => self.state = if (self.tls_mode == .disabled) .connected else .handshake,
-            .zero_rtt => if (self.state == .pre_init) self.state = .handshake,
+            .zero_rtt => {
+                if (self.tls_mode == .disabled and self.state == .pre_init) {
+                    self.state = .handshake;
+                }
+            },
             .handshake => self.state = if (self.tls_mode == .disabled) .connected else .handshake,
-            .one_rtt => if (self.state == .pre_init) self.state = if (self.tls_mode == .disabled) .connected else .handshake else {},
+            .one_rtt => {
+                if (self.state == .pre_init) {
+                    self.state = if (self.tls_mode == .disabled) .connected else .handshake;
+                }
+            },
             .retry => self.state = if (self.tls_mode == .disabled) .connected else .handshake,
         }
         if (header.version != 0) self.version = header.version;
     }
 
-    pub fn onPacketPayload(self: *QuicConn, header: PacketHeader, payload: []const u8) !void {
+    pub fn onPacketPayload(self: *QuicConn, header: PacketHeader, payload: []const u8, packet_len: usize) !void {
         self.state_mu.lock();
         defer self.state_mu.unlock();
         if (self.state == .closed) return error.ConnectionClosed;
+        if (header.packet_type == .zero_rtt and !self.allow_zero_rtt) {
+            return error.InvalidPacket;
+        }
+        self.addBytesSaturating(&self.bytes_received_from_peer, packet_len);
+        if (header.is_long and header.version != SUPPORTED_QUIC_VERSION and header.version != 0) {
+            self.applyConnectionClose();
+            return error.InvalidPacket;
+        }
+        if (self.isStalePacketNumber(header.packet_number)) return error.InvalidPacket;
+        if (self.tls_mode == .real and self.tls_state != .established) {
+            switch (header.packet_type) {
+                .zero_rtt, .one_rtt => {
+                    self.applyConnectionClose();
+                    return error.InvalidPacket;
+                },
+                else => {},
+            }
+        }
         self.registerReceivedPacket(header.packet_number);
         try self.maybeRetransmit();
         if (self.tls_mode == .disabled and self.tls_state != .established) {
@@ -1326,7 +1598,7 @@ pub const QuicServer = struct {
     running: std.atomic.Value(bool),
     connections: std.AutoHashMap(ConnectionId, *QuicConn),
     conn_mu: std.Thread.Mutex,
-    pending: std.ArrayList(*QuicConn),
+    pending: std.ArrayListUnmanaged(*QuicConn),
     worker: std.Thread,
     tls_mode: QuicTlsMode,
 
@@ -1336,7 +1608,7 @@ pub const QuicServer = struct {
         cert_path: []const u8,
         key_path: []const u8,
     ) !QuicServer {
-        const tls_mode: QuicTlsMode = if (cert_path.len > 0 and key_path.len > 0) .placeholder else .disabled;
+        const tls_mode: QuicTlsMode = if (cert_path.len > 0 and key_path.len > 0) .real else .disabled;
 
         const sock = try std.posix.socket(bind_addr.any.family, std.posix.SOCK.DGRAM, 0);
         errdefer std.posix.close(sock);
@@ -1365,7 +1637,7 @@ pub const QuicServer = struct {
             .running = std.atomic.Value(bool).init(true),
             .connections = std.AutoHashMap(ConnectionId, *QuicConn).init(allocator),
             .conn_mu = .{},
-            .pending = std.ArrayList(*QuicConn).init(allocator),
+            .pending = .{},
             .worker = undefined,
             .tls_mode = tls_mode,
         };
@@ -1388,7 +1660,7 @@ pub const QuicServer = struct {
             self.allocator.destroy(conn);
         }
         self.connections.clearAndFree();
-        self.pending.deinit();
+        self.pending.deinit(self.allocator);
     }
 
     pub fn accept(self: *QuicServer) !*QuicConn {
@@ -1400,7 +1672,7 @@ pub const QuicServer = struct {
                 return conn;
             }
             self.conn_mu.unlock();
-            std.time.sleep(1_000_000);
+            std.Thread.sleep(1 * std.time.ns_per_ms);
         }
         return error.ServerStopped;
     }
@@ -1425,64 +1697,121 @@ pub const QuicServer = struct {
             self.tls_mode,
         );
         try self.connections.put(conn.dcid, conn);
-        try self.pending.append(conn);
+        try self.pending.append(self.allocator, conn);
         return conn;
     }
 
     fn handlePacket(self: *QuicServer, packet: []const u8, peer_addr: std.posix.sockaddr, peer_len: std.posix.socklen_t) void {
-        const header = parsePacketHeader(packet) catch return;
-        self.conn_mu.lock();
-        defer self.conn_mu.unlock();
+        var cursor: usize = 0;
+        while (cursor < packet.len) {
+            const rest = packet[cursor..];
+            var header_lookup: ?PacketHeader = null;
+            var conn: ?*QuicConn = null;
+            var packet_len: usize = rest.len;
 
-        var conn: ?*QuicConn = self.connections.get(header.dcid);
-        if (conn == null and header.scid_len > 0) {
-            var it = self.connections.valueIterator();
-            while (it.next()) |entry| {
-                const candidate = entry.*;
-                const candidate_len = @as(usize, candidate.local_cid_len);
-                if (candidate_len == header.scid_len and std.mem.eql(
-                    u8,
-                    candidate.local_cid[0..candidate_len],
-                    header.scid[0..header.scid_len],
-                )) {
-                    conn = candidate;
-                    break;
+            if (self.tls_mode == .real) {
+                var it_lookup = self.connections.valueIterator();
+                while (it_lookup.next()) |entry| {
+                    const candidate = entry.*;
+                    if (parsePacketHeaderWithProtection(candidate, rest)) |parsed| {
+                        header_lookup = parsed;
+                        conn = candidate;
+                        break;
+                    } else |_| {}
+                }
+                if (conn == null) {
+                    header_lookup = parsePacketHeader(rest) catch parseLongHeaderForLookup(rest) catch null;
+                }
+            } else {
+                header_lookup = parsePacketHeader(rest) catch null;
+            }
+
+            const base_header = header_lookup orelse return;
+            packet_len = if (base_header.is_long)
+                base_header.payload_offset + base_header.payload_length
+            else
+                rest.len;
+            if (packet_len == 0 or packet_len > rest.len) return;
+
+            {
+                self.conn_mu.lock();
+                defer self.conn_mu.unlock();
+
+                if (conn == null) {
+                    conn = self.connections.get(base_header.dcid);
+                }
+                if (conn == null and base_header.scid_len > 0) {
+                    var it = self.connections.valueIterator();
+                    while (it.next()) |entry| {
+                        const candidate = entry.*;
+                        const candidate_len = @as(usize, candidate.local_cid_len);
+                        if (candidate_len == base_header.scid_len and std.mem.eql(
+                            u8,
+                            candidate.local_cid[0..candidate_len],
+                            base_header.scid[0..base_header.scid_len],
+                        )) {
+                            conn = candidate;
+                            break;
+                        }
+                    }
+                }
+
+                const packet_slice = rest[0..packet_len];
+                if (conn) |known| {
+                    var header = if (self.tls_mode == .real)
+                        parsePacketHeaderWithProtection(known, packet_slice) catch base_header
+                    else
+                        base_header;
+                    header.packet_number = known.decodePacketNumber(header.packet_number, header.packet_number_len);
+                    if (known.state == .closed) return;
+                    if (!known.canAcceptPeerAddr(peer_addr, peer_len)) {
+                        known.applyConnectionClose();
+                        return;
+                    }
+                    known.peer_addr = peer_addr;
+                    known.peer_addr_len = peer_len;
+                    if (header.packet_number >= known.next_expected_packet_number) {
+                        known.next_expected_packet_number = header.packet_number + 1;
+                    }
+                    known.applyPacket(header);
+                    const payload_end = @min(header.payload_offset + header.payload_length, packet_slice.len);
+                    known.onPacketPayload(
+                        header,
+                        packet_slice[header.payload_offset..payload_end],
+                        packet_slice.len,
+                    ) catch {};
+                } else {
+                    if (!base_header.is_long) return;
+                    if (self.running.load(.acquire) == false) return;
+                    conn = self.registerIncoming(peer_addr, peer_len, base_header) catch return;
+                    if (conn) |fresh| {
+                        var packet_header = if (self.tls_mode == .real)
+                            parsePacketHeaderWithProtection(fresh, packet_slice) catch base_header
+                        else
+                            base_header;
+                        if (fresh.state == .closed) return;
+                        if (!fresh.canAcceptPeerAddr(peer_addr, peer_len)) {
+                            fresh.applyConnectionClose();
+                            return;
+                        }
+                        fresh.peer_addr = peer_addr;
+                        fresh.peer_addr_len = peer_len;
+                        packet_header.packet_number = fresh.decodePacketNumber(packet_header.packet_number, packet_header.packet_number_len);
+                        if (packet_header.packet_number >= fresh.next_expected_packet_number) {
+                            fresh.next_expected_packet_number = packet_header.packet_number + 1;
+                        }
+                        fresh.applyPacket(packet_header);
+                        const payload_end = @min(packet_header.payload_offset + packet_header.payload_length, packet_slice.len);
+                        fresh.onPacketPayload(
+                            packet_header,
+                            packet_slice[packet_header.payload_offset..payload_end],
+                            packet_slice.len,
+                        ) catch {};
+                    }
                 }
             }
-        }
-
-        if (conn) |known| {
-            if (known.state == .closed) return;
-            if (!known.canAcceptPeerAddr(peer_addr, peer_len)) {
-                known.applyConnectionClose();
-                return;
-            }
-            known.peer_addr = peer_addr;
-            known.peer_addr_len = peer_len;
-            if (header.packet_number >= known.next_expected_packet_number) {
-                known.next_expected_packet_number = header.packet_number + 1;
-            }
-            known.applyPacket(header);
-            known.onPacketPayload(header, packet[header.payload_offset..]) catch {};
-            return;
-        }
-
-        if (!header.is_long) return;
-        if (self.running.load(.acquire) == false) return;
-        conn = self.registerIncoming(peer_addr, peer_len, header) catch return;
-        if (conn) |fresh| {
-            if (fresh.state == .closed) return;
-            if (!fresh.canAcceptPeerAddr(peer_addr, peer_len)) {
-                fresh.applyConnectionClose();
-                return;
-            }
-            fresh.peer_addr = peer_addr;
-            fresh.peer_addr_len = peer_len;
-            if (header.packet_number >= fresh.next_expected_packet_number) {
-                fresh.next_expected_packet_number = header.packet_number + 1;
-            }
-            fresh.applyPacket(header);
-            fresh.onPacketPayload(header, packet[header.payload_offset..]) catch {};
+            cursor += packet_len;
+            if (!base_header.is_long) break;
         }
     }
 };
@@ -1500,7 +1829,6 @@ fn pumpLoop(server: *QuicServer) void {
                 err == error.Interrupted or
                 err == error.BadFileDescriptor
             ) continue;
-            _ = err;
             continue;
         };
         if (n == 0) continue;
@@ -1534,7 +1862,7 @@ fn recvFromPumpSocket(
     const err = std.posix.errno(rc);
     switch (err) {
         .SUCCESS => unreachable,
-        .AGAIN, .WOULDBLOCK => return error.WouldBlock,
+        .AGAIN => return error.WouldBlock,
         .INTR => return error.Interrupted,
         .TIMEDOUT => return error.TimedOut,
         .BADF => return error.BadFileDescriptor,
@@ -1556,7 +1884,7 @@ fn parsePacketHeader(data: []const u8) !PacketHeader {
         if ((first & QUIC_LONG_FIXED_BIT) == 0) return error.InvalidPacket;
         if ((first & QUIC_LONG_RESERVED_MASK) != 0) return error.InvalidPacket;
 
-        const packet_type_value = (first >> 4) & 0x03;
+        const packet_type_value: u2 = @intCast((first >> 4) & 0x03);
         const packet_type = switch (packet_type_value) {
             0x00 => PacketType.initial,
             0x01 => PacketType.zero_rtt,
@@ -1591,15 +1919,23 @@ fn parsePacketHeader(data: []const u8) !PacketHeader {
             const token_len_usize = if (token_len.value > std.math.maxInt(usize))
                 return error.InvalidPacket
             else
-                @intCast(token_len.value);
+                @as(usize, @intCast(token_len.value));
             if (off + token_len_usize > data.len) return error.InvalidPacket;
             off += token_len_usize;
         }
+
+        const payload_len_vi = try decodeVarInt(data[off..]);
+        off += payload_len_vi.bytes;
+        const payload_length = if (payload_len_vi.value > std.math.maxInt(usize))
+            return error.InvalidPacket
+        else
+            @as(usize, @intCast(payload_len_vi.value));
 
         const pn_len = try packetNumberLenFromField(first & QUIC_SHORT_PACKET_NUMBER_MASK);
         if (off + pn_len > data.len) return error.InvalidPacket;
         const packet_number = readPacketNumber(data[off .. off + pn_len]);
         off += pn_len;
+        if (off + payload_length > data.len) return error.InvalidPacket;
 
         return PacketHeader{
             .is_long = true,
@@ -1612,6 +1948,7 @@ fn parsePacketHeader(data: []const u8) !PacketHeader {
             .packet_number = packet_number,
             .packet_number_len = @intCast(pn_len),
             .payload_offset = off,
+            .payload_length = payload_length,
         };
     }
 
@@ -1637,8 +1974,215 @@ fn parsePacketHeader(data: []const u8) !PacketHeader {
         .packet_number = packet_number,
         .packet_number_len = @intCast(pn_len),
         .payload_offset = off + pn_len,
+        .payload_length = data.len - (off + pn_len),
     };
 }
+
+fn deriveQuicHpKey(traffic_secret: [32]u8) [16]u8 {
+    var out: [16]u8 = undefined;
+    const label: [17]u8 = .{
+        0x00, 0x10,
+        13,
+        't',  'l',  's',  '1',  '3',
+        ' ',
+        'q',  'u',  'i',  'c',
+        ' ',
+        'h',  'p',
+        0,
+    };
+    HkdfSha256.expand(out[0..], &label, traffic_secret);
+    return out;
+}
+
+fn applyHeaderProtection(hp_key: [16]u8, packet: []u8, pn_offset: usize, pn_len: u8, is_long_header: bool) void {
+    if (pn_len == 0) return;
+    if (packet.len <= pn_offset + @as(usize, pn_len)) return;
+
+    const first_mask: u8 = if (is_long_header) 0x0f else 0x1f;
+
+    const sample_offset = pn_offset + 4;
+    if (sample_offset + 16 > packet.len) return;
+
+    var sample: [16]u8 = undefined;
+    @memcpy(&sample, packet[sample_offset .. sample_offset + 16]);
+
+    var block: [16]u8 = undefined;
+    Aes128.initEnc(hp_key).encrypt(&block, &sample);
+
+    packet[0] ^= block[0] & first_mask;
+    var i: u8 = 0;
+    while (i < pn_len) : (i += 1) {
+        packet[pn_offset + i] ^= block[@intCast(i + 1)];
+    }
+}
+
+fn parseLongHeaderForLookup(data: []const u8) !PacketHeader {
+    if (data.len < 6) return error.InvalidPacket;
+    const first = data[0];
+    if ((first & QUIC_LONG_HEADER) == 0) return error.InvalidPacket;
+    if ((first & QUIC_LONG_FIXED_BIT) == 0) return error.InvalidPacket;
+    if ((first & QUIC_LONG_RESERVED_MASK) != 0) return error.InvalidPacket;
+
+    const packet_type_value: u2 = @intCast((first >> 4) & 0x03);
+    const packet_type = switch (packet_type_value) {
+        0x00 => PacketType.initial,
+        0x01 => PacketType.zero_rtt,
+        0x02 => PacketType.handshake,
+        0x03 => PacketType.retry,
+    };
+    const has_token = packet_type == .initial or packet_type == .retry;
+
+    const version = std.mem.readInt(u32, data[1..5], .big);
+    var off: usize = 5;
+    if (off >= data.len) return error.InvalidPacket;
+
+    const dcid_len = data[off];
+    if (dcid_len > @sizeOf(ConnectionId)) return error.InvalidPacket;
+    off += 1;
+    if (off + dcid_len > data.len) return error.InvalidPacket;
+    var dcid = std.mem.zeroes(ConnectionId);
+    if (dcid_len > 0) @memcpy(dcid[0..dcid_len], data[off .. off + dcid_len]);
+    off += dcid_len;
+
+    if (off >= data.len) return error.InvalidPacket;
+    const scid_len = data[off];
+    if (scid_len > @sizeOf(ConnectionId)) return error.InvalidPacket;
+    off += 1;
+    if (off + scid_len > data.len) return error.InvalidPacket;
+    var scid = std.mem.zeroes(ConnectionId);
+    if (scid_len > 0) @memcpy(scid[0..scid_len], data[off .. off + scid_len]);
+    off += scid_len;
+
+    if (has_token) {
+        const token_len = try decodeVarInt(data[off..]);
+        off += token_len.bytes;
+        if (token_len.value > std.math.maxInt(usize)) return error.InvalidPacket;
+        const token_len_usize: usize = @intCast(token_len.value);
+        if (off + token_len_usize > data.len) return error.InvalidPacket;
+        off += token_len_usize;
+    }
+
+    const payload_len_vi = try decodeVarInt(data[off..]);
+    off += payload_len_vi.bytes;
+    const payload_length = if (payload_len_vi.value > std.math.maxInt(usize))
+        return error.InvalidPacket
+    else
+        @as(usize, @intCast(payload_len_vi.value));
+
+    const pn_len_opts = [_]usize{ 1, 2, 4, 8 };
+    for (pn_len_opts) |pn_len| {
+        const pn_offset = off;
+        if (pn_offset + pn_len > data.len) continue;
+        const packet_number = readPacketNumber(data[pn_offset .. pn_offset + pn_len]);
+        if (pn_offset + pn_len + payload_length > data.len) continue;
+        return PacketHeader{
+            .is_long = true,
+            .packet_type = packet_type,
+            .version = version,
+            .dcid = dcid,
+            .dcid_len = if (dcid_len == 0) DEFAULT_CONNECTION_ID_LEN else dcid_len,
+            .scid = scid,
+            .scid_len = scid_len,
+            .packet_number = packet_number,
+            .packet_number_len = @intCast(pn_len),
+            .payload_offset = pn_offset + pn_len,
+            .payload_length = payload_length,
+        };
+    }
+    return error.InvalidPacket;
+}
+
+fn parsePacketHeaderWithProtection(self: *QuicConn, packet: []const u8) !PacketHeader {
+    if (self.tls_hp_key == null or self.tls_mode != .real) {
+        return parseLongHeaderForLookup(packet) catch parsePacketHeader(packet);
+    }
+
+    if (packet.len == 0) return error.InvalidPacket;
+
+    var decode = try self.allocator.alloc(u8, packet.len);
+    defer self.allocator.free(decode);
+    @memcpy(decode[0..packet.len], packet);
+
+    const first = packet[0];
+    const is_long = (first & QUIC_LONG_HEADER) != 0;
+    if (is_long) {
+        const packet_type_value: u2 = @intCast((first >> 4) & 0x03);
+        const has_token = packet_type_value == 0x00 or packet_type_value == 0x03;
+        var off: usize = 5;
+        if (off >= packet.len) return error.InvalidPacket;
+        const dcid_len = packet[off];
+        off += 1;
+        if (off + @as(usize, dcid_len) > packet.len) return error.InvalidPacket;
+        off += @as(usize, dcid_len);
+        if (off >= packet.len) return error.InvalidPacket;
+        const scid_len = packet[off];
+        off += 1;
+        if (off + @as(usize, scid_len) > packet.len) return error.InvalidPacket;
+        off += @as(usize, scid_len);
+        if (has_token) {
+            if (off >= packet.len) return error.InvalidPacket;
+            const token_len = decodeVarInt(packet[off..]) catch return error.InvalidPacket;
+            off += token_len.bytes;
+            if (token_len.value > std.math.maxInt(usize)) return error.InvalidPacket;
+            const token_len_usize: usize = @intCast(token_len.value);
+            if (off + token_len_usize > packet.len) return error.InvalidPacket;
+            off += token_len_usize;
+        }
+        const payload_len_vi = decodeVarInt(packet[off..]) catch return error.InvalidPacket;
+        off += payload_len_vi.bytes;
+        if (payload_len_vi.value > std.math.maxInt(usize)) return error.InvalidPacket;
+        const payload_length: usize = @intCast(payload_len_vi.value);
+        if (off + payload_length > packet.len) return error.InvalidPacket;
+
+        const pn_len_options = [_]usize{ 1, 2, 4, 8 };
+        for (pn_len_options) |pn_len| {
+            const pn_offset = off;
+            if (pn_offset + pn_len > packet.len) continue;
+            if (pn_offset + 4 + 16 > packet.len) continue;
+            @memcpy(decode[0..packet.len], packet);
+            var sample: [16]u8 = undefined;
+            @memcpy(&sample, decode[pn_offset + 4 .. pn_offset + 20]);
+            var block: [16]u8 = undefined;
+            Aes128.initEnc(self.tls_hp_key.?).encrypt(&block, &sample);
+
+            const first_masked = decode[0] ^ (block[0] & 0x0f);
+            if ((packetNumberLenFromField(first_masked & 0x03) catch continue) != pn_len) {
+                continue;
+            }
+            decode[0] = first_masked;
+            var i: usize = 0;
+            while (i < pn_len) : (i += 1) {
+                decode[pn_offset + i] ^= block[i + 1];
+            }
+            if (parsePacketHeader(decode)) |decoded| {
+                return decoded;
+            } else |_| {}
+        }
+        return error.InvalidPacket;
+    }
+
+    if (packet.len < 1 + @as(usize, DEFAULT_CONNECTION_ID_LEN) + QUIC_PACKET_NUMBER_BYTES_4) return error.InvalidPacket;
+
+    const pn_offset = 1 + @as(usize, DEFAULT_CONNECTION_ID_LEN);
+    const pn_len_options = [_]usize{1, 2, 4, 8};
+    for (pn_len_options) |pn_len| {
+        if (pn_offset + pn_len > packet.len) continue;
+        if (pn_offset + 4 + 16 > packet.len) continue;
+        @memcpy(decode[0..packet.len], packet);
+        applyHeaderProtection(self.tls_hp_key.?, decode[0..packet.len], pn_offset, @intCast(pn_len), false);
+        if (parsePacketHeader(decode[0..packet.len])) |decoded| {
+            if (decoded.packet_number_len == @as(u8, @intCast(pn_len))) return decoded;
+        } else |_| {}
+    }
+    return error.InvalidPacket;
+}
+
+fn tlsRxHasFullFrame(self: *QuicConn) bool {
+    if (self.crypto_rx.items.len < 4) return false;
+    const body_len = std.mem.readInt(u24, self.crypto_rx.items[1..4], .big);
+    return self.crypto_rx.items.len >= body_len + 4;
+}
+
 
 fn packetNumberLenFromField(field: u8) !usize {
     return switch (field & 0x03) {
@@ -1669,18 +2213,26 @@ fn writePacketNumber(dst: []u8, packet_number: u64, len: usize) ![]u8 {
             dst[start] = @truncate(packet_number >> 8);
             dst[start + 1] = @truncate(packet_number);
         },
-        4 => std.mem.writeInt(u32, dst[start .. start + 4], @truncate(packet_number), .big),
-        8 => std.mem.writeInt(u64, dst[start .. start + 8], packet_number, .big),
+        4 => std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(&dst[start])), @truncate(packet_number), .big),
+        8 => std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(&dst[start])), packet_number, .big),
         else => return error.InvalidPacket,
     }
     return dst[dst.len - len .. dst.len];
 }
 
+fn packetNumberLen(packet_number: u64) u8 {
+    if (packet_number <= std.math.maxInt(u8)) return 1;
+    if (packet_number <= std.math.maxInt(u16)) return 2;
+    if (packet_number <= std.math.maxInt(u32)) return 4;
+    return 8;
+}
+
 fn packetHeaderOverhead(conn: *const QuicConn) usize {
+    const pn_len = @as(usize, packetNumberLen(conn.send_packet_number));
     if (conn.state == .connected) {
-        return 1 + @as(usize, conn.dcid_len) + QUIC_PACKET_NUMBER_BYTES_4;
+        return 1 + @as(usize, conn.dcid_len) + pn_len;
     }
-    return 1 + QUIC_PACKET_NUMBER_BYTES_4 + 1 + @as(usize, conn.dcid_len) + 1 + @as(usize, conn.local_cid_len) + 1 + QUIC_PACKET_NUMBER_BYTES_4;
+    return 1 + 4 + 1 + @as(usize, conn.dcid_len) + 1 + @as(usize, conn.local_cid_len) + pn_len;
 }
 
 fn encodePacketHeader(
@@ -1691,14 +2243,19 @@ fn encodePacketHeader(
     scid: []const u8,
     packet_number: u64,
     packet_type: PacketType,
+    payload_length: usize,
 ) !usize {
+    var length_buf: [16]u8 = undefined;
+    const length_n = try encodeVarInt(length_buf[0..], payload_length);
+    const length_bytes = length_buf[0..length_n];
+
     var off: usize = 0;
-    const packet_number_len = QUIC_PACKET_NUMBER_BYTES_4;
+    const packet_number_len: usize = @intCast(packetNumberLen(packet_number));
     const packet_number_field = try packetNumberFieldFromLen(packet_number_len);
 
     if (use_long) {
         const token_space = if (packet_type == .initial or packet_type == .retry) @as(usize, 1) else @as(usize, 0);
-        if (out.len < 1 + 4 + 1 + dcid.len + 1 + scid.len + token_space + packet_number_len) return error.FrameTooLarge;
+        if (out.len < 1 + 4 + 1 + dcid.len + 1 + scid.len + token_space + length_bytes.len + packet_number_len) return error.FrameTooLarge;
         const type_bits: u8 = switch (packet_type) {
             .initial => 0x00,
             .zero_rtt => 0x10,
@@ -1708,7 +2265,7 @@ fn encodePacketHeader(
         };
         out[off] = QUIC_LONG_HEADER | QUIC_LONG_FIXED_BIT | type_bits | packet_number_field;
         off += 1;
-        std.mem.writeInt(u32, out[off .. off + 4], version, .big);
+        std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(&out[off])), version, .big);
         off += 4;
         out[off] = @as(u8, @intCast(dcid.len));
         off += 1;
@@ -1722,6 +2279,8 @@ fn encodePacketHeader(
             out[off] = 0;
             off += 1;
         }
+        @memcpy(out[off .. off + length_bytes.len], length_bytes);
+        off += length_bytes.len;
     } else {
         if (out.len < 1 + dcid.len + packet_number_len) return error.FrameTooLarge;
         out[off] = QUIC_SHORT_FIXED_BIT | packet_number_field;
@@ -1825,6 +2384,7 @@ pub const QuicError = error{
     ConnectionClosed,
     FrameTooLarge,
     HandshakeInProgress,
+    AmplificationLimitExceeded,
     Timeout,
     FlowControl,
     InvalidStream,
@@ -1902,6 +2462,7 @@ test "quic long and short headers are parseable after RFC-style encoding" {
         &scid,
         10,
         .initial,
+        0,
     );
     const parsed_long = try parsePacketHeader(wire[0..encoded]);
     try std.testing.expect(parsed_long.is_long);
@@ -1916,6 +2477,7 @@ test "quic long and short headers are parseable after RFC-style encoding" {
         &.{},
         10,
         .one_rtt,
+        0,
     );
     const parsed_short = try parsePacketHeader(wire[0..short_len]);
     try std.testing.expect(!parsed_short.is_long);
@@ -1934,6 +2496,7 @@ test "quic short header rejects reserved bits" {
         &.{},
         5,
         .one_rtt,
+        0,
     );
 
     var bad = wire;

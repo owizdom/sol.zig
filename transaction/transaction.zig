@@ -25,9 +25,18 @@ pub const CompiledInstruction = struct {
 
 pub const Message = struct {
     header: MessageHeader,
+    has_version_marker: bool = false,
+    version: u8 = 0,
+    address_table_lookups: []const AddressLookupTableEntry = &.{},
     account_keys: []const types.Pubkey,
     recent_blockhash: types.Hash,
     instructions: []const CompiledInstruction,
+};
+
+pub const AddressLookupTableEntry = struct {
+    account_key: types.Pubkey,
+    writable_indexes: []const u8,
+    readonly_indexes: []const u8,
 };
 
 pub const Transaction = struct {
@@ -39,6 +48,10 @@ pub const Transaction = struct {
         var off: usize = 0;
 
         // Message header
+        if (self.message.version > 0 or self.message.has_version_marker) {
+            buf[off] = 0x80 | self.message.version;
+            off += 1;
+        }
         buf[off]     = self.message.header.num_required_signatures;
         buf[off + 1] = self.message.header.num_readonly_signed_accounts;
         buf[off + 2] = self.message.header.num_readonly_unsigned_accounts;
@@ -68,6 +81,22 @@ pub const Transaction = struct {
             off += encoding.writeCompactU16(@intCast(ix.data.len), buf[off..]);
             @memcpy(buf[off..][0..ix.data.len], ix.data);
             off += ix.data.len;
+        }
+
+        if (self.message.version > 0 or self.message.has_version_marker) {
+            off += encoding.writeCompactU16(@intCast(self.message.address_table_lookups.len), buf[off..]);
+            for (self.message.address_table_lookups) |lookup| {
+                @memcpy(buf[off..][0..32], &lookup.account_key.bytes);
+                off += 32;
+
+                off += encoding.writeCompactU16(@intCast(lookup.writable_indexes.len), buf[off..]);
+                @memcpy(buf[off..][0..lookup.writable_indexes.len], lookup.writable_indexes);
+                off += lookup.writable_indexes.len;
+
+                off += encoding.writeCompactU16(@intCast(lookup.readonly_indexes.len), buf[off..]);
+                @memcpy(buf[off..][0..lookup.readonly_indexes.len], lookup.readonly_indexes);
+                off += lookup.readonly_indexes.len;
+            }
         }
 
         return buf[0..off];
@@ -104,6 +133,10 @@ pub fn serialize(tx: Transaction, buf: []u8) !usize {
     }
 
     // Message header
+    if (tx.message.version > 0 or tx.message.has_version_marker) {
+        buf[off] = 0x80 | tx.message.version;
+        off += 1;
+    }
     buf[off]     = tx.message.header.num_required_signatures;
     buf[off + 1] = tx.message.header.num_readonly_signed_accounts;
     buf[off + 2] = tx.message.header.num_readonly_unsigned_accounts;
@@ -135,6 +168,22 @@ pub fn serialize(tx: Transaction, buf: []u8) !usize {
         off += ix.data.len;
     }
 
+    if (tx.message.version > 0 or tx.message.has_version_marker) {
+        off += encoding.writeCompactU16(@intCast(tx.message.address_table_lookups.len), buf[off..]);
+        for (tx.message.address_table_lookups) |lookup| {
+            @memcpy(buf[off..][0..32], &lookup.account_key.bytes);
+            off += 32;
+
+            off += encoding.writeCompactU16(@intCast(lookup.writable_indexes.len), buf[off..]);
+            @memcpy(buf[off..][0..lookup.writable_indexes.len], lookup.writable_indexes);
+            off += lookup.writable_indexes.len;
+
+            off += encoding.writeCompactU16(@intCast(lookup.readonly_indexes.len), buf[off..]);
+            @memcpy(buf[off..][0..lookup.readonly_indexes.len], lookup.readonly_indexes);
+            off += lookup.readonly_indexes.len;
+        }
+    }
+
     return off;
 }
 
@@ -162,6 +211,14 @@ pub fn deserialize(buf: []const u8, allocator: std.mem.Allocator) !Transaction {
     }
 
     if (off + 3 > buf.len) return error.InvalidMessage;
+    var has_version_marker: bool = false;
+    var version: u8 = 0;
+    if (off < buf.len and (buf[off] & 0x80) != 0) {
+        has_version_marker = true;
+        version = buf[off] & 0x7f;
+        off += 1;
+    }
+
     const header = MessageHeader{
         .num_required_signatures = buf[off],
         .num_readonly_signed_accounts = buf[off + 1],
@@ -225,10 +282,61 @@ pub fn deserialize(buf: []const u8, allocator: std.mem.Allocator) !Transaction {
         };
     }
 
+    var lookups = std.ArrayListUnmanaged(AddressLookupTableEntry){};
+    errdefer {
+        for (lookups.items) |*lookup| {
+            allocator.free(lookup.writable_indexes);
+            allocator.free(lookup.readonly_indexes);
+        }
+        lookups.deinit(allocator);
+    }
+
+    if (has_version_marker) {
+        const lookup_count_u16 = try encoding.readCompactU16(buf[off..], &used);
+        off += used;
+        const lookup_count = @as(usize, lookup_count_u16);
+
+        try lookups.ensureUnusedCapacity(allocator, lookup_count);
+        var lidx: usize = 0;
+        while (lidx < lookup_count) : (lidx += 1) {
+            if (off + 32 > buf.len) return error.InvalidMessage;
+            var table_key: types.Pubkey = undefined;
+            @memcpy(&table_key.bytes, buf[off .. off + 32]);
+            off += 32;
+
+            const writable_len_u16 = try encoding.readCompactU16(buf[off..], &used);
+            off += used;
+            const writable_len = @as(usize, writable_len_u16);
+            if (off + writable_len > buf.len) return error.InvalidMessage;
+            const writable_indexes = try allocator.alloc(u8, writable_len);
+            @memcpy(writable_indexes, buf[off .. off + writable_len]);
+            off += writable_len;
+
+            const readonly_len_u16 = try encoding.readCompactU16(buf[off..], &used);
+            off += used;
+            const readonly_len = @as(usize, readonly_len_u16);
+            if (off + readonly_len > buf.len) return error.InvalidMessage;
+            const readonly_indexes = try allocator.alloc(u8, readonly_len);
+            @memcpy(readonly_indexes, buf[off .. off + readonly_len]);
+            off += readonly_len;
+
+            try lookups.append(allocator, .{
+                .account_key = table_key,
+                .writable_indexes = writable_indexes,
+                .readonly_indexes = readonly_indexes,
+            });
+        }
+    }
+
+    const address_table_lookups = try lookups.toOwnedSlice(allocator);
+
     return Transaction{
         .signatures = signatures,
         .message = .{
             .header = header,
+            .has_version_marker = has_version_marker,
+            .version = version,
+            .address_table_lookups = address_table_lookups,
             .account_keys = account_keys,
             .recent_blockhash = blockhash,
             .instructions = instructions,
@@ -244,6 +352,11 @@ pub fn free(self: Transaction, allocator: std.mem.Allocator) void {
         allocator.free(ix.data);
     }
     allocator.free(self.message.instructions);
+    for (self.message.address_table_lookups) |lookup| {
+        allocator.free(lookup.writable_indexes);
+        allocator.free(lookup.readonly_indexes);
+    }
+    allocator.free(self.message.address_table_lookups);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -404,4 +517,46 @@ test "deserialize round-trip transaction bytes" {
     try std.testing.expectEqual(tx.message.account_keys.len, decoded.message.account_keys.len);
     try std.testing.expectEqual(tx.message.instructions.len, decoded.message.instructions.len);
     try std.testing.expectEqual(tx.message.header.num_required_signatures, decoded.message.header.num_required_signatures);
+}
+
+test "deserialize and serialize v0 message with explicit version marker" {
+    const alt_table = types.Pubkey{ .bytes = [_]u8{9} ** 32 };
+    const sig = types.Signature{ .bytes = [_]u8{3} ** 64 };
+    const key_a = types.Pubkey{ .bytes = [_]u8{1} ** 32 };
+    const key_b = types.Pubkey{ .bytes = [_]u8{2} ** 32 };
+
+    const tx = Transaction{
+        .signatures = &[_]types.Signature{sig},
+        .message = .{
+            .has_version_marker = true,
+            .version = 0,
+            .header = .{
+                .num_required_signatures = 1,
+                .num_readonly_signed_accounts = 0,
+                .num_readonly_unsigned_accounts = 0,
+            },
+            .account_keys = &[_]types.Pubkey{ key_a, key_b },
+            .recent_blockhash = types.Hash.ZERO,
+            .instructions = &[_]CompiledInstruction{},
+            .address_table_lookups = &[_]AddressLookupTableEntry{
+                .{
+                    .account_key = alt_table,
+                    .writable_indexes = &[_]u8{},
+                    .readonly_indexes = &[_]u8{0},
+                },
+            },
+        },
+    };
+
+    var buf: [512]u8 = undefined;
+    const n = try serialize(tx, &buf);
+    const decoded = try deserialize(buf[0..n], std.testing.allocator);
+    defer free(decoded, std.testing.allocator);
+
+    try std.testing.expect(decoded.message.has_version_marker);
+    try std.testing.expectEqual(@as(usize, 1), decoded.message.address_table_lookups.len);
+    try std.testing.expectEqual(@as(usize, 2), decoded.message.account_keys.len);
+    try std.testing.expectEqual(key_a.bytes[0], decoded.message.account_keys[0].bytes[0]);
+    try std.testing.expectEqual(key_b.bytes[0], decoded.message.account_keys[1].bytes[0]);
+    try std.testing.expectEqual(alt_table.bytes[0], decoded.message.address_table_lookups[0].account_key.bytes[0]);
 }

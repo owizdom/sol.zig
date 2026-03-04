@@ -186,6 +186,12 @@ fn parseSlotFromSnapshotName(name: []const u8) ?types.Slot {
 }
 
 pub fn compressPayload(payload: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    if (payload.len > 0) {
+        if (compressZstdRaw(payload, allocator)) |zstd_payload| {
+            return zstd_payload;
+        } else |_| {}
+    }
+
     const rle_payload = try rleCompress(payload, allocator);
     defer allocator.free(rle_payload);
     const use_rle = rle_payload.len < payload.len;
@@ -342,6 +348,54 @@ fn rleCompress(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice();
 }
 
+fn compressZstdRaw(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    // Pure-Zig stream writer for a valid, checksum-less zstd single-frame stream.
+    // This avoids any external dependencies while keeping wire compatibility for readers.
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+
+    try out.appendSlice(ZSTD_MAGIC[0..]);
+    // Single-segment frame, 8-byte Frame_Content_Size, no dict, no checksum.
+    // FHD bits: 7-6=11 (8-byte FCS), 5=1 (Single_Segment → no Window_Descriptor), 4-0=0.
+    try out.append(0xE0);
+    var fcs_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &fcs_buf, @as(u64, input.len), .little);
+    try out.appendSlice(&fcs_buf);
+
+    var remaining: usize = input.len;
+    var in_off: usize = 0;
+    const max_block_size: usize = 0x1F_FFFF; // 2^21 - 1
+
+    while (remaining > 0) {
+        const take = @min(remaining, max_block_size);
+        const is_last = remaining == take;
+        try writeZstdRawBlockHeader(&out, take, is_last);
+        try out.appendSlice(input[in_off .. in_off + take]);
+        remaining -= take;
+        in_off += take;
+    }
+    if (input.len == 0) {
+        // Single empty raw block.
+        try writeZstdRawBlockHeader(&out, 0, true);
+    }
+    return out.toOwnedSlice();
+}
+
+fn writeZstdRawBlockHeader(out: *std.array_list.Managed(u8), block_size: usize, last: bool) !void {
+    if (block_size > 0x1F_FFFF) return SnapshotError.CompressionFailed;
+
+    // Block header format (little-endian, 3 bytes):
+    // bits[1..0]=block_type (00 = raw), bit[2]=reserved, bits[3..23]=size, bit24=last
+    // In practice: raw block header is encoded as:
+    // value = (block_size << 3) | (last ? 1 : 0)
+    // where block_type for raw is 0.
+    const block_len: u32 = @intCast(block_size);
+    const header: u32 = (block_len << 3) | (if (last) @as(u32, 1) else 0);
+    try out.append(@as(u8, @truncate(header)));
+    try out.append(@as(u8, @truncate(header >> 8)));
+    try out.append(@as(u8, @truncate(header >> 16)));
+}
+
 fn rleDecompress(body: []const u8, expected_len: u64, allocator: std.mem.Allocator) ![]u8 {
     var out = try allocator.alloc(u8, @as(usize, @intCast(expected_len)));
     errdefer allocator.free(out);
@@ -384,7 +438,7 @@ fn decompressZstd(payload: []const u8, allocator: std.mem.Allocator) ![]u8 {
     defer out.deinit();
 
     var zstd_stream: std.compress.zstd.Decompress = .init(&input, &.{}, .{});
-    try zstd_stream.reader.streamRemaining(&out.writer);
+    _ = try zstd_stream.reader.streamRemaining(&out.writer);
     if (zstd_stream.err != null) return SnapshotError.CompressionFailed;
 
     return out.toOwnedSlice();
@@ -418,8 +472,14 @@ test "snapshot write/load roundtrip" {
     );
     defer std.testing.allocator.free(snapshot_contents);
 
-    try std.testing.expect(snapshot_contents.len >= SNAPSHOT_FRAME_MAGIC.len);
-    try std.testing.expect(std.mem.eql(u8, snapshot_contents[0..SNAPSHOT_FRAME_MAGIC.len], SNAPSHOT_FRAME_MAGIC));
+    if (snapshot_contents.len >= SNAPSHOT_FRAME_MAGIC.len and
+        std.mem.eql(u8, snapshot_contents[0..SNAPSHOT_FRAME_MAGIC.len], SNAPSHOT_FRAME_MAGIC))
+    {
+        // legacy local frame format
+    } else {
+        try std.testing.expect(snapshot_contents.len >= ZSTD_MAGIC.len);
+        try std.testing.expect(std.mem.eql(u8, snapshot_contents[0..ZSTD_MAGIC.len], ZSTD_MAGIC));
+    }
 
     var loaded = accounts_db.AccountsDb.init(std.testing.allocator);
     defer loaded.deinit();

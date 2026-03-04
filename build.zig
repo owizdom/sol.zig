@@ -6,31 +6,33 @@ pub fn build(b: *std.Build) void {
     const rocksdb_source = b.option(
         []const u8,
         "rocksdb-source",
-        "Path to a RocksDB source tree; Zig will build it with cmake for this project",
+        "Path to a RocksDB source tree (ignored; pure-Zig mode)",
     );
     const rocksdb_include = b.option(
         []const u8,
         "rocksdb-include",
-        "Path to RocksDB headers (directory containing rocksdb/c.h)",
+        "Path to RocksDB headers (ignored; pure-Zig mode)",
     );
     const rocksdb_lib = b.option(
         []const u8,
         "rocksdb-lib",
-        "Path to RocksDB libraries (directory with librocksdb.*)",
+        "Path to RocksDB libraries (ignored; pure-Zig mode)",
     );
-    var resolved_rocksdb_include = rocksdb_include;
-    var resolved_rocksdb_lib = rocksdb_lib;
-    var rocksdb_build_step: ?*std.Build.Step = null;
 
-    if (rocksdb_source) |source_dir| {
-        const rocksdb_build_dir = ".zig-cache/rocksdb";
-        const cmake = b.addSystemCommand(&.{ "cmake", "-S", source_dir, "-B", rocksdb_build_dir, "-DCMAKE_BUILD_TYPE=Release", "-DWITH_TESTS=OFF", "-DWITH_TOOLS=OFF", "-DWITH_BENCHMARK_TOOLS=OFF", "-DROCKSDB_BUILD_SHARED=ON", "-DROCKSDB_INSTALL=OFF", "-DROCKSDB_INSTALL_LIBDIR=." });
-        const cmake_build = b.addSystemCommand(&.{ "cmake", "--build", rocksdb_build_dir, "--parallel", "4" });
-        cmake_build.step.dependOn(&cmake.step);
-        rocksdb_build_step = &cmake_build.step;
-        if (resolved_rocksdb_include == null) resolved_rocksdb_include = source_dir;
-        if (resolved_rocksdb_lib == null) resolved_rocksdb_lib = rocksdb_build_dir;
+    if (rocksdb_source) |path| {
+        std.debug.print("[warn] rocksdb-source is ignored in pure-Zig build: {s}\n", .{path});
     }
+    if (rocksdb_include) |path| {
+        std.debug.print("[warn] rocksdb-include is ignored in pure-Zig build: {s}\n", .{path});
+    }
+    if (rocksdb_lib) |path| {
+        std.debug.print("[warn] rocksdb-lib is ignored in pure-Zig build: {s}\n", .{path});
+    }
+
+    // Pure-Zig default: no RocksDB, no external C toolchain.
+    const use_rocksdb = false;
+    const resolved_rocksdb_lib_path: ?std.Build.LazyPath = null;
+    const rocksdb_build_step: ?*std.Build.Step = null;
 
     // ── Storage modules (pure Zig, zero C deps) ───────────────────────────
     const storage_wal_mod = b.addModule("storage/wal", .{
@@ -59,6 +61,13 @@ pub fn build(b: *std.Build) void {
     const base58_mod = b.addModule("base58", .{
         .root_source_file = b.path("encoding/base58.zig"),
     });
+    const snapshot_bootstrap_mod = b.addModule("snapshot/bootstrap", .{
+        .root_source_file = b.path("snapshot/bootstrap.zig"),
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+            .{ .name = "base58", .module = base58_mod },
+        },
+    });
     const keypair_mod = b.addModule("keypair", .{
         .root_source_file = b.path("account/keypair.zig"),
         .imports = &.{
@@ -72,11 +81,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const rocksdb_mod = b.addModule("rocksdb", .{
-        .root_source_file = b.path("rocksdb.zig"),
+        .root_source_file = b.path("rocksdb_stub.zig"),
     });
-    if (resolved_rocksdb_include) |include_dir| {
-        rocksdb_mod.addIncludePath(b.path(include_dir));
-    }
     const transaction_mod = b.addModule("transaction", .{
         .root_source_file = b.path("transaction/transaction.zig"),
         .imports = &.{
@@ -224,6 +230,9 @@ pub fn build(b: *std.Build) void {
     });
     const net_quic_mod = b.addModule("net/quic", .{
         .root_source_file = b.path("network/quic/quic.zig"),
+        .imports = &.{
+            .{ .name = "net/tls13", .module = tls13_mod },
+        },
     });
     const net_tls_cert_mod = b.addModule("net/tls_cert", .{
         .root_source_file = b.path("network/tls_cert/tls_cert.zig"),
@@ -320,8 +329,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "metrics", .module = metrics_mod },
             .{ .name = "metrics_server", .module = metrics_server_mod },
             .{ .name = "snapshot", .module = snapshot_mod },
+            .{ .name = "snapshot/bootstrap", .module = snapshot_bootstrap_mod },
             .{ .name = "net/tpu_quic", .module = net_tpu_quic_mod },
             .{ .name = "net/tls_cert", .module = net_tls_cert_mod },
+            .{ .name = "net/turbine",  .module = net_turbine_mod },
+            .{ .name = "net/shred",    .module = net_shred_mod },
         },
     });
 
@@ -341,8 +353,8 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_root_mod,
     });
     exe.linkLibC();
-    exe.linkSystemLibrary("rocksdb");
-    if (resolved_rocksdb_lib) |lib_dir| exe.addLibraryPath(b.path(lib_dir));
+    if (use_rocksdb) exe.linkSystemLibrary("rocksdb");
+    if (resolved_rocksdb_lib_path) |lib_path| exe.addLibraryPath(lib_path);
     if (rocksdb_build_step) |step| exe.step.dependOn(step);
     b.installArtifact(exe);
 
@@ -368,8 +380,8 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
     bench_exe.linkLibC();
-    bench_exe.linkSystemLibrary("rocksdb");
-    if (resolved_rocksdb_lib) |lib_dir| bench_exe.addLibraryPath(b.path(lib_dir));
+    if (use_rocksdb) bench_exe.linkSystemLibrary("rocksdb");
+    if (resolved_rocksdb_lib_path) |lib_path| bench_exe.addLibraryPath(lib_path);
     if (rocksdb_build_step) |step| bench_exe.step.dependOn(step);
     b.installArtifact(bench_exe);
 
@@ -393,14 +405,39 @@ pub fn build(b: *std.Build) void {
         .root_module = harness_mod,
     });
     harness_exe.linkLibC();
-    harness_exe.linkSystemLibrary("rocksdb");
-    if (resolved_rocksdb_lib) |lib_dir| harness_exe.addLibraryPath(b.path(lib_dir));
+    if (use_rocksdb) harness_exe.linkSystemLibrary("rocksdb");
+    if (resolved_rocksdb_lib_path) |lib_path| harness_exe.addLibraryPath(lib_path);
     if (rocksdb_build_step) |step| harness_exe.step.dependOn(step);
     b.installArtifact(harness_exe);
 
     const run_harness = b.addRunArtifact(harness_exe);
     const harness_step = b.step("replay-harness", "Run continuous fixture replay against local validator services");
     harness_step.dependOn(&run_harness.step);
+
+    // ── Devnet smoke test binary ───────────────────────────────────────
+    const devnet_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("bin/devnet_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    devnet_smoke_mod.addImport("keypair", keypair_mod);
+    devnet_smoke_mod.addImport("validator", validator_mod);
+    devnet_smoke_mod.addImport("base58", base58_mod);
+    devnet_smoke_mod.addImport("snapshot/bootstrap", snapshot_bootstrap_mod);
+
+    const devnet_smoke_exe = b.addExecutable(.{
+        .name = "devnet-smoke",
+        .root_module = devnet_smoke_mod,
+    });
+    devnet_smoke_exe.linkLibC();
+    if (use_rocksdb) devnet_smoke_exe.linkSystemLibrary("rocksdb");
+    if (resolved_rocksdb_lib_path) |lib_path| devnet_smoke_exe.addLibraryPath(lib_path);
+    if (rocksdb_build_step) |step| devnet_smoke_exe.step.dependOn(step);
+    b.installArtifact(devnet_smoke_exe);
+
+    const run_devnet_smoke = b.addRunArtifact(devnet_smoke_exe);
+    const devnet_smoke_step = b.step("devnet-smoke", "Run devnet smoke harness");
+    devnet_smoke_step.dependOn(&run_devnet_smoke.step);
 
     // ── Tests (all modules via main test block) ────────────────────────
     const test_root_mod = b.createModule(.{
@@ -447,8 +484,8 @@ pub fn build(b: *std.Build) void {
         .root_module = test_root_mod,
     });
     tests.linkLibC();
-    tests.linkSystemLibrary("rocksdb");
-    if (resolved_rocksdb_lib) |lib_dir| tests.addLibraryPath(b.path(lib_dir));
+    if (use_rocksdb) tests.linkSystemLibrary("rocksdb");
+    if (resolved_rocksdb_lib_path) |lib_path| tests.addLibraryPath(lib_path);
     if (rocksdb_build_step) |step| tests.step.dependOn(step);
 
     const test_run = b.addRunArtifact(tests);

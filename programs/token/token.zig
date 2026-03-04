@@ -94,7 +94,7 @@ fn ensureDataLen(allocator: std.mem.Allocator, account: *AccountRef, needed: usi
     account.data.* = next;
 }
 
-fn requireWritable(account: *AccountRef) Error!void {
+fn requireWritable(account: *const AccountRef) Error!void {
     if (!account.is_writable) return error.AccountNotWritable;
 }
 
@@ -107,11 +107,14 @@ fn requireAccountLen(account: *const AccountRef, needed: usize) Error!void {
 }
 
 fn readU64(data: []const u8, start: usize) u64 {
-    return std.mem.readInt(u64, data[start .. start + 8], .little);
+    var bytes: [8]u8 = undefined;
+    @memcpy(&bytes, data[start .. start + 8]);
+    return std.mem.readInt(u64, &bytes, .little);
 }
 
 fn writeU64(data: []u8, start: usize, value: u64) void {
-    std.mem.writeInt(u64, data[start .. start + 8], value, .little);
+    const target: *align(1) [8]u8 = @as(*align(1) [8]u8, @ptrCast(&data[start]));
+    std.mem.writeInt(u64, target, value, .little);
 }
 
 fn addU64(a: u64, b: u64) Error!u64 {
@@ -168,11 +171,23 @@ fn parseAmount(ix_data: []const u8) Error!u64 {
     return std.mem.readInt(u64, ix_data[4..12], .little);
 }
 
-fn parseCheckedAmount(ix_data: []const u8) Error!struct { amount: u64, decimals: u8 } {
+const CheckedAmount = struct {
+    amount: u64,
+    decimals: u8,
+};
+
+fn parseCheckedAmount(ix_data: []const u8) Error!CheckedAmount {
     if (ix_data.len < 13) return error.InvalidInstruction;
     return .{
         .amount = try parseAmount(ix_data),
         .decimals = ix_data[12],
+    };
+}
+
+fn parseAmountChecked(ix_data: []const u8, checked: bool) !CheckedAmount {
+    return if (checked) try parseCheckedAmount(ix_data) else .{
+        .amount = try parseAmount(ix_data),
+        .decimals = 0,
     };
 }
 
@@ -296,7 +311,7 @@ fn setTokenFrozen(token: *AccountRef, allocator: std.mem.Allocator, value: bool)
     writeBoolFlag(token.data.*, TOKEN_FROZEN_OFFSET, value);
 }
 
-fn transferBetween(accounts: []const AccountRef, ix_data: []const u8, checked: bool, _: bool, allocator: std.mem.Allocator) !void {
+fn transferBetween(accounts: []AccountRef, ix_data: []const u8, checked: bool, _: bool, allocator: std.mem.Allocator) !void {
     if (accounts.len < 3 + @as(usize, @intFromBool(checked))) return error.InvalidAccountLayout;
     const source = &accounts[0];
     const destination = &accounts[1];
@@ -309,7 +324,7 @@ fn transferBetween(accounts: []const AccountRef, ix_data: []const u8, checked: b
     try requireAccountLen(destination, TOKEN_ACCOUNT_MIN_SIZE);
     if (isTokenFrozen(source) or isTokenFrozen(destination)) return error.InvalidAccountData;
 
-    const parsed = if (checked) try parseCheckedAmount(ix_data) else .{ .amount = try parseAmount(ix_data), .decimals = 0 };
+    const parsed = try parseAmountChecked(ix_data, checked);
     const amount = parsed.amount;
     if (amount == 0) return;
 
@@ -426,7 +441,7 @@ fn executeApprove(accounts: []AccountRef, ix_data: []const u8, checked: bool, al
     const delegate = &accounts[1];
     const authority = &accounts[2];
     const expected = readPubkeyAt(token_account.data.*, TOKEN_OWNER_OFFSET) orelse return error.InvalidAccountData;
-    const parsed = if (checked) try parseCheckedAmount(ix_data) else .{ .amount = try parseAmount(ix_data), .decimals = 0 };
+    const parsed = try parseAmountChecked(ix_data, checked);
     if (checked) {
         const mint = &accounts[3];
         try requireAccountLen(mint, MINT_MIN_SIZE);
@@ -535,10 +550,10 @@ fn executeMintTo(accounts: []AccountRef, ix_data: []const u8, checked: bool, _: 
     const destination = &accounts[1];
     const authority = &accounts[2];
 
-    const parsed = if (checked) try parseCheckedAmount(ix_data) else .{ .amount = try parseAmount(ix_data), .decimals = 0 };
+    const parsed = try parseAmountChecked(ix_data, checked);
     try ensureMintMetadata(mint);
     if (checked) {
-        try requireAccountLen(accounts[3], MINT_MIN_SIZE);
+        try requireAccountLen(&accounts[3], MINT_MIN_SIZE);
         if (parsed.decimals != accounts[3].data.*[MINT_DECIMALS_OFFSET]) return error.InvalidInstructionData;
     }
 
@@ -571,7 +586,7 @@ fn executeBurn(accounts: []AccountRef, ix_data: []const u8, checked: bool) !void
     const mint = &accounts[1];
     const authority = &accounts[2];
 
-    const parsed = if (checked) try parseCheckedAmount(ix_data) else .{ .amount = try parseAmount(ix_data), .decimals = 0 };
+    const parsed = try parseAmountChecked(ix_data, checked);
     try requireAccountLen(source, TOKEN_ACCOUNT_MIN_SIZE);
     try requireAccountLen(mint, MINT_MIN_SIZE);
     if (checked) {

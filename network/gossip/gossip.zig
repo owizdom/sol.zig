@@ -13,6 +13,12 @@ pub const Error = error{
     InvalidSignature,
     BufferTooSmall,
 };
+const RecvError = error{
+    WouldBlock,
+    TimedOut,
+    Interrupted,
+    BadFileDescriptor,
+};
 
 // ── CRDS value types ─────────────────────────────────────────────────────────
 
@@ -405,6 +411,38 @@ fn readMessageKind(buf: []const u8) !GossipMsgKind {
     return std.meta.intToEnum(GossipMsgKind, std.mem.readInt(u32, buf[0..4], .little));
 }
 
+fn recvFromSocket(
+    sock: std.posix.socket_t,
+    buf: []u8,
+    flags: u32,
+    src_addr: *std.posix.sockaddr,
+    src_len: *std.posix.socklen_t,
+) RecvError!usize {
+    const rc = std.c.recvfrom(
+        sock,
+        @ptrCast(buf.ptr),
+        buf.len,
+        flags,
+        src_addr,
+        src_len,
+    );
+    if (rc >= 0) return @intCast(rc);
+
+    const err = std.posix.errno(rc);
+    switch (err) {
+        .SUCCESS => unreachable,
+        .AGAIN => return error.WouldBlock,
+        .INTR => return error.Interrupted,
+        .TIMEDOUT => return error.TimedOut,
+        .BADF,
+        .CONNREFUSED,
+        .CONNRESET,
+        .CONNABORTED,
+        .NOTCONN => return error.BadFileDescriptor,
+        else => return error.BadFileDescriptor,
+    }
+}
+
 // ── GossipNode ───────────────────────────────────────────────────────────────
 
 pub const GossipNode = struct {
@@ -482,6 +520,42 @@ pub const GossipNode = struct {
         _ = metrics.GLOBAL.gossip_messages_sent.fetchAdd(1, .monotonic);
     }
 
+    /// Update the address this node advertises to the network.
+    /// Call this after discovering your public IP so devnet validators can reach you.
+    pub fn setAdvertisedAddr(self: *GossipNode, addr: std.net.Address) void {
+        self.my_info.gossip       = addr;
+        self.my_info.tvu          = addr;
+        self.my_info.tpu          = addr;
+        self.my_info.tpu_fwd      = addr;
+        self.my_info.repair       = addr;
+        self.my_info.serve_repair = addr;
+        self.my_info.wallclock    = @intCast(std.time.milliTimestamp());
+    }
+
+    /// Add a peer directly as a gossip contact.
+    pub fn seedPeer(self: *GossipNode, peer: std.net.Address) !void {
+        const peer_id = peerIdFromAddress(peer);
+        const ci = ContactInfo{
+            .id = .{ .bytes = peer_id },
+            .wallclock = @intCast(std.time.milliTimestamp()),
+            .gossip = peer,
+            .tvu = peer,
+            .tpu = peer,
+            .tpu_fwd = peer,
+            .repair = peer,
+            .serve_repair = peer,
+            .shred_version = 0,
+        };
+        try self.crds.upsertContact(ci);
+    }
+
+    /// Seed gossip node with a list of peer endpoints.
+    pub fn seedPeers(self: *GossipNode, peers: []const std.net.Address) void {
+        for (peers) |peer| {
+            self.seedPeer(peer) catch {};
+        }
+    }
+
     /// Handle an inbound pull request and reply with up-to-16 CRDS entries.
     pub fn handlePullRequest(self: *GossipNode, from_addr: std.net.Address, buf: []const u8) !void {
         if (buf.len < 68) return error.InvalidPacket;
@@ -536,23 +610,24 @@ pub const GossipNode = struct {
             if (off + GOSSIP_PULL_RESPONSE_ENTRY_BYTES > buf.len) return error.InvalidPacket;
 
             const entry = buf[off .. off + GOSSIP_PULL_RESPONSE_ENTRY_BYTES];
-            var ci: ContactInfo = undefined;
-            ci.id.bytes = entry[0..32].*;
-            ci.shred_version = 0;
             const port = std.mem.readInt(u16, entry[32..34], .little);
             const ip: [4]u8 = entry[36..40].*;
             const addr = std.net.Address.initIp4(ip, port);
+            const ci = ContactInfo{
+                .id = .{ .bytes = entry[0..32].* },
+                .wallclock = @intCast(std.time.milliTimestamp()),
+                .gossip = addr,
+                .tvu = addr,
+                .tpu = addr,
+                .tpu_fwd = addr,
+                .repair = addr,
+                .serve_repair = addr,
+                .shred_version = 0,
+            };
             if (self.crds.contacts.get(ci.id.bytes) != null) {
                 off += GOSSIP_PULL_RESPONSE_ENTRY_BYTES;
                 continue;
             }
-            ci.gossip = addr;
-            ci.tvu = addr;
-            ci.tpu = addr;
-            ci.tpu_fwd = addr;
-            ci.repair = addr;
-            ci.serve_repair = addr;
-            ci.wallclock = @intCast(std.time.milliTimestamp());
             try self.crds.upsertContact(ci);
 
             off += GOSSIP_PULL_RESPONSE_ENTRY_BYTES;
@@ -564,7 +639,7 @@ pub const GossipNode = struct {
         var buf: [MAX_GOSSIP_PACKET]u8 = undefined;
         var src_addr: std.posix.sockaddr align(4) = undefined;
         var src_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-        const n = std.posix.recvfrom(
+        const n = recvFromSocket(
             self.sock,
             &buf,
             std.posix.MSG.DONTWAIT,
@@ -572,6 +647,7 @@ pub const GossipNode = struct {
             &src_len,
         ) catch |err| {
             if (err == error.WouldBlock) return error.NoData;
+            if (err == error.BadFileDescriptor) return error.NoData;
             return err;
         };
         _ = metrics.GLOBAL.gossip_messages_recv.fetchAdd(1, .monotonic);
@@ -650,6 +726,14 @@ pub const GossipNode = struct {
         var i: usize = 0;
 
         while (self.running.load(.acquire)) {
+            // Drain any inbound packets each cycle to keep CRDS progressing.
+            var recv_count: usize = 0;
+            while (recv_count < 16) : (recv_count += 1) {
+                self.recvOnce() catch |err| {
+                    if (err == error.NoData) {} else return;
+                };
+            }
+
             // Push to all known peers.
             var peers = std.array_list.Managed(ContactInfo).init(self.allocator);
             self.crds.getPeers(&peers) catch {};
@@ -675,6 +759,21 @@ pub const GossipNode = struct {
         return std.Thread.spawn(.{}, GossipNode.runPushLoop, .{self});
     }
 };
+
+fn peerIdFromAddress(addr: std.net.Address) [32]u8 {
+    const ip_bytes: [4]u8 = @bitCast(addr.in.sa.addr);
+    var port_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &port_bytes, addr.getPort(), .big);
+
+    var hasher = Sha256.init(.{});
+    hasher.update("sig-gossip-peer");
+    hasher.update(&ip_bytes);
+    hasher.update(&port_bytes);
+
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
 
 test "crds table upsert" {
     var table = CrdsTable.init(std.testing.allocator);

@@ -104,6 +104,7 @@ fn mapRuntimeError(err: anyerror) RuntimeError {
         error.NotEnoughFunds => RuntimeError.InsufficientFunds,
         error.InvalidSigner,
         error.AccountNotSigner => RuntimeError.AccountNotSigner,
+        error.DuplicateAccount => RuntimeError.DuplicateAccount,
         error.Unauthorized => RuntimeError.Unauthorized,
         error.MaxCpiDepthExceeded => RuntimeError.MaxCpiDepthExceeded,
 
@@ -151,11 +152,16 @@ pub fn loadAccounts(
     allocator: std.mem.Allocator,
 ) !LoadedAccounts {
     const n = message.account_keys.len;
-    const arr = try allocator.alloc(LoadedAccounts.LoadedAccount, n);
-
-    const n_signed  = message.header.num_required_signatures;
+    const n_signed = message.header.num_required_signatures;
     const n_ro_sign = message.header.num_readonly_signed_accounts;
-    const n_ro_uns  = message.header.num_readonly_unsigned_accounts;
+    const n_ro_uns = message.header.num_readonly_unsigned_accounts;
+
+    if (n_ro_sign > n_signed) return error.InvalidInstructionData;
+    if (n_ro_uns > n - n_signed) return error.InvalidInstructionData;
+
+    try validateDuplicateAccountMeta(message, allocator);
+
+    const arr = try allocator.alloc(LoadedAccounts.LoadedAccount, n);
 
     for (message.account_keys, 0..) |key, i| {
         const is_signer   = i < n_signed;
@@ -210,6 +216,34 @@ pub fn loadAccounts(
     return .{ .accounts = arr, .allocator = allocator };
 }
 
+const AccountMetaFlags = packed struct {
+    is_signer: bool,
+    is_writable: bool,
+};
+
+fn validateDuplicateAccountMeta(message: *const transaction.Message, allocator: std.mem.Allocator) RuntimeError!void {
+    var seen = std.AutoHashMap([32]u8, AccountMetaFlags).init(allocator);
+    defer seen.deinit();
+
+    const n = message.account_keys.len;
+    for (message.account_keys, 0..) |key, i| {
+        const is_signer = i < message.header.num_required_signatures;
+        const is_writable = if (is_signer)
+            i < (message.header.num_required_signatures - message.header.num_readonly_signed_accounts)
+        else
+            i < (n - message.header.num_readonly_unsigned_accounts);
+        const flags = AccountMetaFlags{ .is_signer = is_signer, .is_writable = is_writable };
+
+        if (seen.get(key.bytes)) |prev| {
+            if (prev.is_signer != flags.is_signer or prev.is_writable != flags.is_writable) {
+                return error.DuplicateAccount;
+            }
+        } else {
+            try seen.put(key.bytes, flags);
+        }
+    }
+}
+
 /// Commit loaded accounts back to AccountsDB after successful execution.
 pub fn commitAccounts(
     db:   *accounts_db.AccountsDb,
@@ -235,6 +269,8 @@ pub fn executeInstruction(
     ix:      transaction.CompiledInstruction,
     la:      *LoadedAccounts,
 ) RuntimeError!u64 {
+    const before = ctx.compute_used;
+
     if (ix.program_id_index >= message.account_keys.len) return error.InvalidAccountIndex;
     const program_id = message.account_keys[ix.program_id_index];
     const program_owner = la.accounts[ix.program_id_index].owner;
@@ -261,7 +297,7 @@ pub fn executeInstruction(
         };
     }
     const refs = refs_buf[0..ix.accounts.len];
-    normalizeInstructionRefs(refs);
+    try normalizeInstructionRefs(refs);
     for (refs) |a| {
         if (bpf_prog.isSysvarAccount(&a.key) and a.is_writable) return error.InvalidAccountLayout;
     }
@@ -302,7 +338,7 @@ pub fn executeInstruction(
             .is_writable = la.accounts[ix.program_id_index].is_writable,
         };
         const remaining_budget = COMPUTE_UNIT_LIMIT -| ctx.compute_used;
-        const execution = try bpf_prog.executeProgramWithFeaturesAndBudgetDetailed(
+        const execution = bpf_prog.executeProgramWithFeaturesAndBudgetDetailed(
             program_ref,
             refs,
             ix.data,
@@ -310,7 +346,7 @@ pub fn executeInstruction(
             ctx.allocator,
             remaining_budget,
             ctx.helper_features,
-        );
+        ) catch |err| return mapRuntimeError(err);
         const exit_code = execution.exit_code;
         if (exit_code != 0) return error.ProgramFailed;
         try ctx.chargeCompute(execution.compute_used);
@@ -319,33 +355,39 @@ pub fn executeInstruction(
         return error.InvalidProgramId;
     }
 
-    return ctx.compute_used;
+    return ctx.compute_used - before;
 }
 
-fn normalizeInstructionRefs(refs: []AccountRef) void {
+fn normalizeInstructionRefs(refs: []AccountRef) RuntimeError!void {
     if (refs.len == 0) return;
 
     for (refs, 0..) |*current, i| {
         var writable = current.is_writable;
         var signer = current.is_signer;
+        var seen_writable = current.is_writable;
 
         var j: usize = i + 1;
         while (j < refs.len) : (j += 1) {
             if (!isSamePubkey(&current.key, &refs[j].key)) continue;
+            if (writable != refs[j].is_writable) return error.DuplicateAccount;
             writable = writable or refs[j].is_writable;
             signer = signer or refs[j].is_signer;
+            seen_writable = seen_writable or refs[j].is_writable;
         }
 
         var j2: usize = 0;
         while (j2 < i) : (j2 += 1) {
             if (!isSamePubkey(&current.key, &refs[j2].key)) continue;
+            if (seen_writable != refs[j2].is_writable) return error.DuplicateAccount;
             writable = writable or refs[j2].is_writable;
             signer = signer or refs[j2].is_signer;
+            seen_writable = seen_writable or refs[j2].is_writable;
         }
 
         current.is_writable = writable;
         current.is_signer = signer;
     }
+    return;
 }
 
 fn isSamePubkey(a: *const types.Pubkey, b: *const types.Pubkey) bool {
@@ -502,4 +544,26 @@ test "runtime rejects writable sysvar account references" {
 
     var ctx = InvokeContext.init(&db, slot, 0, recent_bh, std.testing.allocator, bpf_prog.DefaultHelperFeatures);
     try std.testing.expectError(error.InvalidAccountLayout, executeTransaction(&ctx, &msg, &la));
+}
+
+test "loadAccounts rejects duplicate account keys with conflicting mutability" {
+    var db = accounts_db.AccountsDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const key = types.Pubkey{ .bytes = [_]u8{0x11} ** 32 };
+    const msg = transaction.Message{
+        .header = .{
+            .num_required_signatures = 0,
+            .num_readonly_signed_accounts = 0,
+            .num_readonly_unsigned_accounts = 1,
+        },
+        .account_keys = &[_]types.Pubkey{ key, key },
+        .recent_blockhash = types.Hash.ZERO,
+        .instructions = &[_]transaction.CompiledInstruction{},
+    };
+
+    try std.testing.expectError(
+        error.DuplicateAccount,
+        loadAccounts(&db, &msg, std.testing.allocator),
+    );
 }

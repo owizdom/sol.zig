@@ -135,7 +135,7 @@ fn handleConnection(srv: *TpuQuicServer, conn: *quic.QuicConn) void {
 
     // Fair MEV queue: collect parsed transactions with arrival timestamps,
     // sort by arrival_ns before dispatching to the bank.
-    var pending = std.ArrayList(PendingTx).init(srv.allocator);
+    var pending = std.array_list.Managed(PendingTx).init(srv.allocator);
     defer {
         for (pending.items) |*p| srv.allocator.free(p.data);
         pending.deinit();
@@ -345,6 +345,13 @@ fn parseTransactionLengthFromStream(raw: []const u8) TxParseError!?usize {
     off = try checkedAdd(off, try checkedMul(@as(usize, sig_count), 64));
     if (off > raw.len) return null;
 
+    var has_version_marker = false;
+    if (off < raw.len and (raw[off] & 0x80) != 0) {
+        has_version_marker = true;
+        off = try checkedAdd(off, 1);
+        if (off > raw.len) return null;
+    }
+
     off = try checkedAdd(off, 3);
     if (off > raw.len) return null;
 
@@ -370,20 +377,39 @@ fn parseTransactionLengthFromStream(raw: []const u8) TxParseError!?usize {
         if (off > raw.len) return null;
     }
 
+    if (has_version_marker) {
+        const lookup_count = try readCompactLen(raw, &off) orelse return null;
+        const lookup_count_usize = @as(usize, lookup_count);
+        var lookup_idx: usize = 0;
+        while (lookup_idx < lookup_count_usize) : (lookup_idx += 1) {
+            off = try checkedAdd(off, 32);
+            if (off > raw.len) return null;
+
+            const writable_count = try readCompactLen(raw, &off) orelse return null;
+            off = try checkedAdd(off, @as(usize, writable_count));
+            if (off > raw.len) return null;
+
+            const readonly_count = try readCompactLen(raw, &off) orelse return null;
+            off = try checkedAdd(off, @as(usize, readonly_count));
+            if (off > raw.len) return null;
+        }
+    }
+
     return off;
 }
 
 fn readCompactLen(raw: []const u8, off: *usize) TxParseError!?u16 {
     if (off.* >= raw.len) return null;
 
-    var shift: u8 = 0;
+    var shift: u5 = 0;
     var value: u16 = 0;
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         const index = off.* + i;
         if (index >= raw.len) return null;
         const byte = raw[index];
-        value |= @as(u16, byte & 0x7f) << shift;
+        const shift_bits: u4 = @intCast(shift);
+        value |= @as(u16, byte & 0x7f) << shift_bits;
         if ((byte & 0x80) == 0) {
             off.* += i + 1;
             return value;
@@ -404,6 +430,16 @@ fn checkedMul(a: usize, b: usize) TxParseError!usize {
     if (a == 0 or b == 0) return 0;
     if (a > (std.math.maxInt(usize) / b)) return TxParseError.InvalidFrame;
     return a * b;
+}
+
+fn nextRand(v: *u64) u64 {
+    v.* = (v.* *% 6364136223846793005) +% 1;
+    return v.*;
+}
+
+fn randRange(v: *u64, max: usize) usize {
+    if (max == 0) return 0;
+    return @as(usize, @intCast(nextRand(v) % @as(u64, max)));
 }
 
 fn buildTestTransaction(out: []u8, payload_len: usize) usize {
@@ -447,21 +483,11 @@ test "property: TPU frame parsing is stable across random chunk boundaries" {
     var seed: u64 = 0xC0FFEE_1234;
     const iterations: usize = 64;
 
-    fn nextRand(v: *u64) u64 {
-        v.* = (v.* * 6364136223846793005) + 1;
-        return v.*;
-    }
-
-    fn randRange(v: *u64, max: usize) usize {
-        if (max == 0) return 0;
-        return @as(usize, @intCast(nextRand(v) % @as(u64, max)));
-    }
-
     var it: usize = 0;
     while (it < iterations) : (it += 1) {
         var stream = std.ArrayList(u8).init(std.testing.allocator);
         defer stream.deinit();
-        var frame_count = 1 + randRange(&seed, 8);
+        const frame_count = 1 + randRange(&seed, 8);
         var tx_template: [MAX_TX_LEN]u8 = undefined;
         var frame_idx: usize = 0;
         while (frame_idx < frame_count) : (frame_idx += 1) {
@@ -494,4 +520,39 @@ test "property: TPU frame parsing is stable across random chunk boundaries" {
             try std.testing.expectEqual(contiguous.items[i], chunked.items[i]);
         }
     }
+}
+
+test "TPU stream parser supports v0 versioned transactions" {
+    const sig = types.Signature{ .bytes = [_]u8{0x11} ** 64 };
+    const signer = types.Pubkey{ .bytes = [_]u8{1} ** 32 };
+    const recipient = types.Pubkey{ .bytes = [_]u8{2} ** 32 };
+    const alt_table = types.Pubkey{ .bytes = [_]u8{3} ** 32 };
+
+    const tx = transaction.Transaction{
+        .signatures = &[_]types.Signature{sig},
+        .message = .{
+            .version = 0,
+            .has_version_marker = true,
+            .header = .{
+                .num_required_signatures = 1,
+                .num_readonly_signed_accounts = 0,
+                .num_readonly_unsigned_accounts = 1,
+            },
+            .account_keys = &[_]types.Pubkey{ signer, recipient },
+            .recent_blockhash = types.Hash.ZERO,
+            .instructions = &[_]transaction.CompiledInstruction{},
+            .address_table_lookups = &[_]transaction.AddressLookupTableEntry{
+                .{
+                    .account_key = alt_table,
+                    .writable_indexes = &[_]u8{0},
+                    .readonly_indexes = &[_]u8{},
+                },
+            },
+        },
+    };
+
+    var buf: [512]u8 = undefined;
+    const n = try transaction.serialize(tx, &buf);
+    const parsed_len = (try parseTransactionLengthFromStream(buf[0..n])).?;
+    try std.testing.expectEqual(n, parsed_len);
 }
